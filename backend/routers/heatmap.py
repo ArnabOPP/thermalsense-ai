@@ -21,7 +21,7 @@ def get_heatmap(
     city:       str = Query(default="kolkata"),
     year:       int = Query(default=2024),
     season:     str = Query(default="pre_monsoon"),
-    max_pixels: int = Query(default=5000, le=10000),
+    max_pixels: int = Query(default=15000, le=30000),
 ):
     """
     Get spatial heatmap data for Kolkata.

@@ -33,7 +33,7 @@ export const getStats   = () => get('/stats')
  * Get spatial heatmap pixels.
  * variable: "lst" | "ndvi" | "ndbi" | "isa_pct" | "shap_era5_humidity" etc.
  */
-export const getHeatmap = (variable = 'lst', city = 'kolkata', maxPixels = 5000) =>
+export const getHeatmap = (variable = 'lst', city = 'kolkata', maxPixels = 15000) =>
   get(`/heatmap?variable=${variable}&city=${city}&max_pixels=${maxPixels}`)
 
 /** List available scenarios */
