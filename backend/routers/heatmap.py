@@ -41,7 +41,7 @@ def get_heatmap(
 
     # Determine which column to use
     if variable == "lst":
-        col = "lst_predicted"
+        col = "lst_celsius"
         unit = "°C"
     elif variable.startswith("shap_"):
         if store.shap_df is None:
