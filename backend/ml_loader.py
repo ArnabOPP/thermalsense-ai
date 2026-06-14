@@ -25,7 +25,7 @@ SUPPORTED_CITIES = {
         "name": "Kolkata",
         "center": [22.55, 88.37],
         "zoom": 12,
-        "feature_matrix": ROOT / "outputs" / "exports" / "kolkata" / "feature_matrix_kolkata_ALL.parquet",
+        "feature_matrix": ROOT / "outputs" / "exports" / "kolkata" / "feature_matrix_kolkata_clipped.parquet",
     },
     "delhi": {
         "name": "Delhi",
