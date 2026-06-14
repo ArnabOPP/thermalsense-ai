@@ -4,65 +4,63 @@ Fetches real-time LST for any city bbox from Google Earth Engine MODIS MOD11A1.
 """
 from fastapi import APIRouter, Query, HTTPException
 from loguru import logger
-import json, os
+import os
 import numpy as np
 
 router = APIRouter()
 
+
 def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
     """Fetch MODIS LST for a bbox around lat/lon using GEE."""
+    import ee
+
+    project = os.environ.get("EE_PROJECT_ID", "thermalsense")
+
     try:
-        import ee
-        # Authenticate
-        project = os.environ.get("EE_PROJECT_ID", "thermalsense")
+        ee.Initialize(project=project)
+    except Exception:
         try:
-            ee.Initialize(project=project)
-        except Exception:
             ee.Authenticate(auth_mode="service_account")
             ee.Initialize(project=project)
+        except Exception as auth_err:
+            raise HTTPException(status_code=500, detail=f"GEE auth failed: {auth_err}")
 
-        # Define bbox
-        bbox = ee.Geometry.BBox(
-            lon - radius_deg, lat - radius_deg,
-            lon + radius_deg, lat + radius_deg
-        )
+    bbox = ee.Geometry.BBox(
+        lon - radius_deg, lat - radius_deg,
+        lon + radius_deg, lat + radius_deg
+    )
 
-        # MODIS LST - most recent 30 days
-        modis = (ee.ImageCollection("MODIS/061/MOD11A1")
-                 .filterDate("2024-03-01", "2024-05-31")  # pre-monsoon 2024
-                 .filterBounds(bbox)
-                 .select("LST_Day_1km")
-                 .mean())
+    modis = (
+        ee.ImageCollection("MODIS/061/MOD11A1")
+        .filterDate("2024-03-01", "2024-05-31")
+        .filterBounds(bbox)
+        .select("LST_Day_1km")
+        .mean()
+    )
 
-        # Scale to Celsius (MODIS LST scale factor = 0.02, offset to Kelvin)
-        lst_celsius = modis.multiply(0.02).subtract(273.15)
+    lst_celsius = modis.multiply(0.02).subtract(273.15)
 
-        # Sample points
-        points = lst_celsius.sample(
-            region=bbox,
-            scale=1000,  # 1km resolution
-            numPixels=2000,
-            seed=42,
-            geometries=True
-        )
+    points = lst_celsius.sample(
+        region=bbox,
+        scale=1000,
+        numPixels=2000,
+        seed=42,
+        geometries=True
+    )
 
-        features = points.getInfo()["features"]
-        pixels = []
-        for f in features:
-            val = f["properties"].get("LST_Day_1km")
-            coords = f["geometry"]["coordinates"]
-            if val is not None and 10 < val < 65:
-                pixels.append({
-                    "lat": round(coords[1], 5),
-                    "lon": round(coords[0], 5),
-                    "value": round(float(val), 2)
-                })
+    features = points.getInfo()["features"]
+    pixels = []
+    for f in features:
+        val = f["properties"].get("LST_Day_1km")
+        coords = f["geometry"]["coordinates"]
+        if val is not None and 10 < val < 65:
+            pixels.append({
+                "lat": round(coords[1], 5),
+                "lon": round(coords[0], 5),
+                "value": round(float(val), 2)
+            })
 
-        return pixels
-
-    except Exception as e:
-        logger.error(f"GEE MODIS fetch failed: {e}")
-        raise HTTPException(status_code=500, detail=f"GEE error: {str(e)}")
+    return pixels
 
 
 @router.get("/heatmap/global", tags=["Global"])
@@ -72,13 +70,16 @@ def global_heatmap(
     radius: float = Query(0.15, description="Radius in degrees (~15km)"),
     name:   str   = Query("Unknown", description="City name for logging"),
 ):
-    """
-    Fetch real-time MODIS LST for any city on Earth.
-    Uses MOD11A1 (Terra) 1km daily LST, pre-monsoon 2024 composite.
-    """
-    logger.info(f"Global heatmap request: {name} ({lat:.3f}, {lon:.3f})")
+    """Fetch real-time MODIS LST for any city on Earth."""
+    logger.info(f"Global heatmap: {name} ({lat:.3f}, {lon:.3f})")
 
-    pixels = get_modis_lst(lat, lon, radius)
+    try:
+        pixels = get_modis_lst(lat, lon, radius)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"MODIS fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     if not pixels:
         raise HTTPException(status_code=404, detail="No MODIS data found for this location")
