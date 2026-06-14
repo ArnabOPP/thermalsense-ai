@@ -1,54 +1,10 @@
-# ThermalSense AI — data-pipeline .gitignore
-
-# Environment & secrets
-.env
-*.key
-*.pem
-gee-key.json
-
-# Large data outputs (never commit these to git)
+frontend/node_modules/
+__pycache__/
+*.pyc
+*.pkl
+*.pt
 outputs/
 logs/
-*.tif
-*.tiff
-*.h5
-*.hdf5
-*.nc
+.env
 *.parquet
-*.feather
-
-# OSMnx cache
-cache/
-
-# Python
-__pycache__/
-*.py[cod]
-*.so
-.Python
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# Conda
-.conda/
-env/
-venv/
-
-# Notebooks (checkpoints)
-.ipynb_checkpoints/
-*.ipynb
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# IDE
-.vscode/
-.idea/
-*.swp
-
-# GEE credentials (cached by earthengine-api, don't commit)
-~/.config/earthengine/
+west-bengal.osm.pbf
