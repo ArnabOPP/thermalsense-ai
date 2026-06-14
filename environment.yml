@@ -1,0 +1,40 @@
+name: thermalsense
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  # Core geospatial
+  - gdal=3.8
+  - rasterio=1.3
+  - geopandas=0.14
+  - shapely=2.0
+  - pyproj=3.6
+  - fiona=1.9
+  - numpy=1.26
+  - scipy=1.11
+  - pandas=2.1
+  # Visualisation (for notebooks / QC)
+  - matplotlib=3.8
+  - seaborn=0.13
+  - folium=0.15
+  # Utilities
+  - tqdm=4.66
+  - pyyaml=6.0
+  - python-dotenv=1.0
+  - pyarrow=14.0        # Parquet support
+  - fastparquet=2023.10
+  - h5py=3.10           # MOSDAC HDF5 files
+  - netcdf4=1.6         # ERA5 / INSAT NetCDF
+  - requests=2.31
+  - aiohttp=3.9
+  - retry=0.9
+  - pip:
+    - earthengine-api>=0.1.384
+    - osmnx>=1.9.1
+    - overpy>=0.7
+    - geemap>=0.30.0
+    - rio-cogeo>=4.0.0
+    - loguru>=0.7.2
+    - rich>=13.7.0

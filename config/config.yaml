@@ -1,0 +1,125 @@
+# ThermalSense AI — pipeline configuration
+# Person A owns this file
+
+cities:
+  kolkata:
+    display_name: "Kolkata"
+    # Bounding box: [west, south, east, north] in WGS84
+    bbox: [88.27, 22.49, 88.43, 22.63]
+    utm_epsg: 32645          # UTM Zone 45N
+    landsat_path: 138
+    landsat_row: 44
+    admin_level: 9           # OSM admin level for wards
+    cpcb_stations:
+      - name: "Rabindra Sarobar"
+        lat: 22.5093
+        lon: 88.3639
+      - name: "Victoria"
+        lat: 22.5448
+        lon: 88.3426
+      - name: "Ballygunge"
+        lat: 22.5260
+        lon: 88.3639
+      - name: "Fort William"
+        lat: 22.5511
+        lon: 88.3338
+
+  # Add new cities here — pipeline auto-configures
+  delhi:
+    display_name: "Delhi"
+    bbox: [76.84, 28.40, 77.35, 28.88]
+    utm_epsg: 32643
+    landsat_path: 146
+    landsat_row: 40
+    admin_level: 8
+    cpcb_stations: []
+
+  mumbai:
+    display_name: "Mumbai"
+    bbox: [72.77, 18.87, 72.99, 19.27]
+    utm_epsg: 32643
+    landsat_path: 148
+    landsat_row: 47
+    admin_level: 9
+    cpcb_stations: []
+
+pipeline:
+  # Target resolution for all aligned rasters (metres)
+  target_resolution: 100
+
+  # Landsat 8/9 settings
+  landsat:
+    collection: "LANDSAT/LC08/C02/T1_L2"
+    cloud_cover_max: 15          # % — scenes above this are skipped
+    # Seasons to pull: list of [start_month, end_month] pairs
+    # Pre-monsoon (hottest) + post-monsoon for contrast
+    seasons:
+      pre_monsoon: [3, 5]        # March–May
+      post_monsoon: [10, 11]     # Oct–Nov
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
+    lst_scale_factor: 0.00341802
+    lst_offset: 149.0            # Kelvin → apply then subtract 273.15 for °C
+    bands:
+      thermal: "ST_B10"
+      red: "SR_B4"
+      nir: "SR_B5"
+      swir1: "SR_B6"
+      swir2: "SR_B7"
+      blue: "SR_B2"
+      green: "SR_B3"
+      qa: "QA_PIXEL"
+
+  # Sentinel-2 settings
+  sentinel2:
+    collection: "COPERNICUS/S2_SR_HARMONIZED"
+    cloud_cover_max: 10
+    bands:
+      blue: "B2"
+      green: "B3"
+      red: "B4"
+      nir: "B8"
+      swir1: "B11"
+      swir2: "B12"
+      qa: "QA60"
+
+  # GHSL (Global Human Settlement Layer)
+  ghsl:
+    height_collection: "JRC/GHSL/P2023A/GHS_BUILT_H/2018"
+    population_collection: "JRC/GHSL/P2023A/GHS_POP/2020"
+
+  # OSM morphology
+  osm:
+    buffer_metres: 5000          # Pull OSM data this far outside bbox
+    grid_size_metres: 100        # Compute morphology per 100m cell
+
+  # Feature engineering
+  features:
+    names:
+      - ndvi
+      - ndwi
+      - ndbi
+      - albedo
+      - isa_pct            # Impervious surface area %
+      - svf                # Sky view factor
+      - building_height    # Mean building height per cell
+      - building_density   # Building footprint / cell area
+      - canyon_ratio       # Mean H/W of street canyons
+      - dist_water_m       # Distance to nearest water body
+      - tatm               # Atmospheric temperature (INSAT-3D)
+      - era5_humidity      # Relative humidity
+      - era5_wind_speed    # Wind speed m/s
+      - doy_sin            # Day of year encoded as sin (cyclical)
+
+gcs:
+  # Google Cloud Storage bucket for exports
+  # Set GCS_BUCKET in .env — do NOT hardcode here
+  prefix: "thermalsense"
+  raw_prefix: "raw"
+  processed_prefix: "processed"
+  exports_prefix: "exports"
+
+paths:
+  raw_dir: "outputs/raw"
+  processed_dir: "outputs/processed"
+  exports_dir: "outputs/exports"
+  logs_dir: "logs"
