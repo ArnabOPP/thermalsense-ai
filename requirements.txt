@@ -11,3 +11,5 @@ python-multipart==0.0.9
 loguru==0.7.2
 python-dotenv==1.0.1
 huggingface_hub>=0.23.0
+earthengine-api>=0.1.370
+earthengine-api>=0.1.370
