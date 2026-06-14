@@ -46,7 +46,7 @@ from loguru import logger
 
 from backend.ml_loader import load_all, store
 from backend.models import HealthResponse
-from backend.routers import predict, heatmap, scenarios, shap
+from backend.routers import predict, heatmap, scenarios, shap, global_heatmap
 
 
 # ─── Lifespan: load models at startup ────────────────────────────────────────
@@ -101,6 +101,7 @@ app.include_router(predict.router)
 app.include_router(heatmap.router)
 app.include_router(scenarios.router)
 app.include_router(shap.router)
+app.include_router(global_heatmap.router)
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────

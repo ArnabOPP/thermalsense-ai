@@ -53,3 +53,5 @@ export const getShap = (maxPixels = 3000) =>
 /** Predict LST for a single pixel (for interactive tool) */
 export const predictLST = (features) => post('/predict', features)
 export const getCities = () => get('/cities')
+export const getGlobalHeatmap = (lat, lon, name, radius = 0.15) =>
+  get(`/heatmap/global?lat=${lat}&lon=${lon}&name=${encodeURIComponent(name)}&radius=${radius}`)
