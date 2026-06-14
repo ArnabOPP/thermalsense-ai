@@ -88,7 +88,7 @@ app.include_router(shap.router)
 @app.get("/", response_model=HealthResponse, tags=["Health"])
 def health():
     """Health check — confirms API is running and models are loaded."""
-    n_pixels = len(store.df_cache) if store.df_cache is not None else 0
+    n_pixels = sum(len(df) for df in store.city_cache.values())
     return HealthResponse(
         status="ok" if store.is_loaded else "loading",
         model_loaded=store.is_loaded,

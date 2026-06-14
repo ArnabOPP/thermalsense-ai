@@ -2,7 +2,7 @@
 // All backend communication goes through here.
 // Person D: never call fetch() directly in components — use these functions.
 
-const BASE = '/api'  // proxied to http://localhost:8000 via vite.config.js
+const BASE = 'https://thermalsense-ai-production.up.railway.app'  // proxied to http://localhost:8000 via vite.config.js
 
 // Generic fetch helper
 async function get(path) {
