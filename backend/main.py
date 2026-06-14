@@ -17,6 +17,26 @@ Run locally:
 
 Then open: http://localhost:8000/docs
 """
+# Download models from HuggingFace if not present locally
+import os
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+_XGB_PATH = _ROOT / "model" / "outputs" / "xgb_model.pkl"
+
+if not _XGB_PATH.exists():
+    print("Models not found locally — downloading from HuggingFace...", flush=True)
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            repo_id="arnabinthegame05/thermalsense-ai-models",
+            repo_type="model",
+            local_dir=str(_ROOT),
+            local_dir_use_symlinks=False,
+        )
+        print("Download complete!", flush=True)
+    except Exception as e:
+        print(f"HuggingFace download failed: {e}", flush=True)
 
 from contextlib import asynccontextmanager
 
