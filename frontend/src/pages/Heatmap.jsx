@@ -182,10 +182,10 @@ export default function Heatmap() {
             <CircleMarker
               key={i}
               center={[p.lat, p.lon]}
-              radius={4}
+              radius={6}
               pathOptions={{
                 fillColor: lstToColor(p.value, vmin, vmax),
-                fillOpacity: 0.85,
+                fillOpacity: 0.9,
                 color: 'transparent',
                 weight: 0,
               }}
