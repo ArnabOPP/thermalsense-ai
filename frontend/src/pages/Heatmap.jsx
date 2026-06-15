@@ -130,7 +130,8 @@ export default function Heatmap() {
     setRawData(null)
     setFilteredPixels([])
     // Pass source to API
-    fetch(`/heatmap/global?lat=${selectedCity.center[0]}&lon=${selectedCity.center[1]}&name=${encodeURIComponent(selectedCity.name)}&radius=${selectedCity.radius}&source=${source}`)
+    const API_BASE = import.meta.env.VITE_API_URL || 'https://thermalsense-ai-production.up.railway.app'
+    fetch(`${API_BASE}/heatmap/global?lat=${selectedCity.center[0]}&lon=${selectedCity.center[1]}&name=${encodeURIComponent(selectedCity.name)}&radius=${selectedCity.radius}&source=${source}`)
       .then(r => r.json())
       .then(data => setRawData(data))
       .catch(console.error)
