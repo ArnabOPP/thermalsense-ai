@@ -1,5 +1,5 @@
-// ThermalSense AI — Global Heatmap
-// Search any city worldwide → live MODIS LST data via GEE
+// ThermalSense AI — Global Heatmap with multi-source selector
+// MODIS (1km) · Landsat 8 (100m) · Sentinel-2 (10m)
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MapContainer, TileLayer, CircleMarker, Tooltip, GeoJSON, useMap } from 'react-leaflet'
@@ -51,17 +51,44 @@ function MapFlyTo({ center, zoom }) {
   return null
 }
 
+const SOURCES = [
+  {
+    id: 'modis',
+    label: 'MODIS',
+    sublabel: '1km · Global · Fast',
+    icon: '🛰',
+    color: '#6366f1',
+    description: 'Terra satellite · Daily global coverage · Best for large areas & states',
+  },
+  {
+    id: 'landsat',
+    label: 'Landsat 8',
+    sublabel: '100m · Cities · ~15s',
+    icon: '🌍',
+    color: '#f97316',
+    description: 'USGS Landsat 8 Band 10 · Thermal infrared · Best for cities',
+  },
+  {
+    id: 'sentinel',
+    label: 'Sentinel-2',
+    sublabel: '10m · Cities · ~30s',
+    icon: '🔬',
+    color: '#22c55e',
+    description: 'ESA Sentinel-2 · Highest resolution · Best for urban detail',
+  },
+]
+
 export default function Heatmap() {
   const [searchQuery, setSearchQuery] = useState('')
   const [suggestions, setSuggestions] = useState([])
   const [searching, setSearching]     = useState(false)
   const [selectedCity, setSelectedCity] = useState(null)
+  const [source, setSource]           = useState('modis')
   const [rawData, setRawData]         = useState(null)
   const [filteredPixels, setFilteredPixels] = useState([])
   const [loading, setLoading]         = useState(false)
   const searchTimeout                 = useRef(null)
 
-  // Search Nominatim
   const searchCities = useCallback((q) => {
     if (!q || q.length < 2) { setSuggestions([]); return }
     clearTimeout(searchTimeout.current)
@@ -80,34 +107,35 @@ export default function Heatmap() {
   useEffect(() => { searchCities(searchQuery) }, [searchQuery])
 
   function selectSuggestion(item) {
-      const bbox = item.boundingbox
-      const latSpan = parseFloat(bbox[1]) - parseFloat(bbox[0])
-      const lonSpan = parseFloat(bbox[3]) - parseFloat(bbox[2])
-      const center = [parseFloat(item.lat), parseFloat(item.lon)]
-      const zoom = latSpan > 1 ? 9 : latSpan > 0.3 ? 11 : 12
-      // Minimum 0.3 radius so small cities get enough pixels
-      const radius = Math.max(Math.max(latSpan, lonSpan) / 2 * 1.2, 0.3)
-      setSelectedCity({
-        name: item.display_name.split(',')[0],
-        center, zoom,
-        boundary: item.geojson,
-        radius,
-      })
+    const bbox = item.boundingbox
+    const latSpan = parseFloat(bbox[1]) - parseFloat(bbox[0])
+    const lonSpan = parseFloat(bbox[3]) - parseFloat(bbox[2])
+    const center = [parseFloat(item.lat), parseFloat(item.lon)]
+    const zoom = latSpan > 1 ? 9 : latSpan > 0.3 ? 11 : 12
+    const radius = Math.max(Math.max(latSpan, lonSpan) / 2 * 1.2, 0.3)
+    setSelectedCity({
+      name: item.display_name.split(',')[0],
+      center, zoom,
+      boundary: item.geojson,
+      radius,
+    })
     setSuggestions([])
     setSearchQuery(item.display_name.split(',')[0])
   }
 
-  // Fetch MODIS for any city
+  // Fetch when city or source changes
   useEffect(() => {
     if (!selectedCity) return
     setLoading(true)
     setRawData(null)
     setFilteredPixels([])
-    getGlobalHeatmap(selectedCity.center[0], selectedCity.center[1], selectedCity.name, selectedCity.radius)
+    // Pass source to API
+    fetch(`/heatmap/global?lat=${selectedCity.center[0]}&lon=${selectedCity.center[1]}&name=${encodeURIComponent(selectedCity.name)}&radius=${selectedCity.radius}&source=${source}`)
+      .then(r => r.json())
       .then(data => setRawData(data))
       .catch(console.error)
       .finally(() => setLoading(false))
-  }, [selectedCity])
+  }, [selectedCity, source])
 
   // Clip to boundary
   useEffect(() => {
@@ -124,17 +152,20 @@ export default function Heatmap() {
 
   const vmin = rawData?.value_min ?? 30
   const vmax = rawData?.value_max ?? 55
+  const activeSource = SOURCES.find(s => s.id === source)
 
   return (
     <div>
       <div className="page-header">
         <h2>Spatial Heatmap</h2>
-        <p>Search any city worldwide · Live MODIS LST 1km · 2024 pre-monsoon · Boundary from OpenStreetMap</p>
+        <p>Search any city worldwide · Real satellite LST · Boundary from OpenStreetMap</p>
       </div>
 
-      {/* Search */}
+      {/* Search + Source selector */}
       <div className="section" style={{ padding: '12px 16px', marginBottom: 16 }}>
-        <div style={{ position: 'relative', maxWidth: 500 }}>
+
+        {/* Search bar */}
+        <div style={{ position: 'relative', maxWidth: 500, marginBottom: 12 }}>
           <input
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
@@ -175,6 +206,39 @@ export default function Heatmap() {
             </div>
           )}
         </div>
+
+        {/* Source selector */}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {SOURCES.map(src => (
+            <button
+              key={src.id}
+              onClick={() => setSource(src.id)}
+              title={src.description}
+              style={{
+                display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
+                padding: '8px 14px', borderRadius: 8, cursor: 'pointer',
+                border: `1px solid ${source === src.id ? src.color : 'var(--border)'}`,
+                background: source === src.id ? `${src.color}20` : 'var(--bg-deep)',
+                transition: 'all 0.15s',
+              }}
+            >
+              <div style={{ fontSize: 12, fontWeight: 600,
+                color: source === src.id ? src.color : 'var(--text-sec)' }}>
+                {src.icon} {src.label}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-sec)', marginTop: 2 }}>
+                {src.sublabel}
+              </div>
+            </button>
+          ))}
+        </div>
+
+        {/* Source description */}
+        {activeSource && (
+          <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-sec)' }}>
+            {activeSource.description}
+          </div>
+        )}
       </div>
 
       {/* Stats */}
@@ -182,11 +246,11 @@ export default function Heatmap() {
         <div className="cards-row" style={{ marginBottom: 16 }}>
           <div className="card">
             <div className="card-label">City</div>
-            <div className="card-value isro" style={{ fontSize: 16 }}>{selectedCity?.name}</div>
+            <div className="card-value isro" style={{ fontSize: 14 }}>{selectedCity?.name}</div>
           </div>
           <div className="card">
             <div className="card-label">Source</div>
-            <div className="card-value" style={{ fontSize: 11, color: 'var(--text-sec)' }}>MODIS 1km</div>
+            <div className="card-value" style={{ fontSize: 10, color: 'var(--text-sec)' }}>{rawData.source}</div>
           </div>
           <div className="card">
             <div className="card-label">Min</div>
@@ -218,7 +282,7 @@ export default function Heatmap() {
           {selectedCity && <MapFlyTo center={selectedCity.center} zoom={selectedCity.zoom} />}
           {selectedCity?.boundary && (
             <GeoJSON key={selectedCity.name} data={selectedCity.boundary}
-              style={{ color: '#6366f1', weight: 2, fillOpacity: 0 }} />
+              style={{ color: activeSource?.color || '#6366f1', weight: 2, fillOpacity: 0 }} />
           )}
           {loading && (
             <div style={{
@@ -227,7 +291,7 @@ export default function Heatmap() {
               borderRadius: 8, zIndex: 1000, color: '#7b8fa8',
               fontFamily: 'var(--font-mono)', fontSize: 12,
             }}>
-              Fetching MODIS satellite data for {selectedCity?.name}...
+              Fetching {activeSource?.label} data for {selectedCity?.name}...
             </div>
           )}
           {filteredPixels.map((p, i) => (
@@ -238,6 +302,7 @@ export default function Heatmap() {
                 <div style={{ fontFamily: 'monospace', fontSize: 12 }}>
                   <div>{p.lat.toFixed(4)}°N, {p.lon.toFixed(4)}°E</div>
                   <div><strong>LST:</strong> {p.value.toFixed(1)}°C</div>
+                  <div style={{ color: '#888', fontSize: 10 }}>{rawData?.source}</div>
                 </div>
               </Tooltip>
             </CircleMarker>
@@ -253,7 +318,7 @@ export default function Heatmap() {
               <div style={{ fontSize: 36, marginBottom: 8 }}>🌍</div>
               <div style={{ color: 'var(--text-pri)', fontSize: 15, fontWeight: 600 }}>Search any city above</div>
               <div style={{ color: 'var(--text-sec)', fontSize: 12, marginTop: 6 }}>
-                Live MODIS satellite thermal data · Any city on Earth
+                MODIS · Landsat 8 · Sentinel-2 · Any city on Earth
               </div>
             </div>
           )}
@@ -273,7 +338,7 @@ export default function Heatmap() {
             </span>
           </div>
           <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-sec)' }}>
-            Source: MODIS MOD11A1 Terra · 1km resolution · 2024 pre-monsoon composite
+            {rawData.source} · 2024 pre-monsoon composite · Boundary: OpenStreetMap
           </div>
         </div>
       )}

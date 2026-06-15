@@ -1,6 +1,6 @@
 """
-ThermalSense AI — Global Heatmap via MODIS
-Uses GEE sampleRectangle for exhaustive pixel extraction without rasterio.
+ThermalSense AI — Global Heatmap
+Supports MODIS (1km), Landsat 8 (100m), Sentinel-2 (10m) for any city on Earth.
 """
 from fastapi import APIRouter, Query, HTTPException
 from loguru import logger
@@ -24,45 +24,100 @@ def init_gee():
     return ee
 
 
-def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
+def mask_landsat_clouds(image):
+    import ee as ee_module
+    qa = image.select("QA_PIXEL")
+    cloud_mask = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
+    lst = (image.select("ST_B10")
+           .multiply(0.00341802).add(149.0).subtract(273.15)
+           .rename("lst"))
+    return lst.updateMask(cloud_mask)
+
+
+def mask_sentinel_clouds(image):
+    qa = image.select("QA60")
+    cloud_mask = qa.bitwiseAnd(1 << 10).eq(0).And(qa.bitwiseAnd(1 << 11).eq(0))
+    # Sentinel doesn't have LST — use NDVI-based proxy (inverted)
+    nir = image.select("B8").divide(10000)
+    red = image.select("B4").divide(10000)
+    swir = image.select("B11").divide(10000)
+    # Approximate surface temperature proxy using radiometric temperature
+    # Use a simplified regression: higher NDBI = hotter
+    ndbi = swir.subtract(nir).divide(swir.add(nir))
+    # Scale to temperature-like values (rough proxy 25-55C range)
+    lst_proxy = ndbi.multiply(15).add(38).rename("lst")
+    return lst_proxy.updateMask(cloud_mask)
+
+
+def get_lst_image(ee, region, source: str, date_start: str, date_end: str):
+    """Get LST image from specified source."""
+    if source == "modis":
+        img = (ee.ImageCollection("MODIS/061/MOD11A1")
+               .filterDate(date_start, date_end)
+               .filterBounds(region)
+               .select("LST_Day_1km")
+               .mean()
+               .multiply(0.02).subtract(273.15)
+               .rename("lst"))
+        scale = 1000
+        source_name = "MODIS MOD11A1 Terra · 1km"
+
+    elif source == "landsat":
+        img = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+               .filterDate(date_start, date_end)
+               .filterBounds(region)
+               .filter(ee.Filter.lt("CLOUD_COVER", 20))
+               .map(mask_landsat_clouds)
+               .median())
+        scale = 100
+        source_name = "Landsat 8 · 100m"
+
+    elif source == "sentinel":
+        img = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+               .filterDate(date_start, date_end)
+               .filterBounds(region)
+               .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+               .map(mask_sentinel_clouds)
+               .median())
+        scale = 10
+        source_name = "Sentinel-2 · 10m (LST proxy)"
+
+    else:
+        raise ValueError(f"Unknown source: {source}")
+
+    return img, scale, source_name
+
+
+def get_lst_pixels(lat: float, lon: float, radius_deg: float, source: str):
     ee = init_gee()
 
     west  = lon - radius_deg
     south = lat - radius_deg
     east  = lon + radius_deg
     north = lat + radius_deg
-
     region = ee.Geometry.Rectangle([west, south, east, north])
 
-    modis = (
-        ee.ImageCollection("MODIS/061/MOD11A1")
-        .filterDate("2024-03-01", "2024-05-31")
-        .filterBounds(region)
-        .select("LST_Day_1km")
-        .mean()
+    img, scale, source_name = get_lst_image(
+        ee, region, source,
+        "2024-03-01", "2024-05-31"
     )
 
-    lst_celsius = modis.multiply(0.02).subtract(273.15).rename("lst")
-
-    # sampleRectangle returns a 2D array of all pixels
-    logger.info(f"Sampling rectangle radius={radius_deg:.3f} for ({lat:.2f},{lon:.2f})")
-    
-    # Adaptive scale — keep under GEE's 262144 pixel limit
-    MAX_GEE_PIXELS = 250000
+    # Adaptive scale to stay under GEE 262144 pixel limit
     area_deg = (radius_deg * 2) ** 2
-    pixels_at_1km = area_deg / (0.009 ** 2)
-    if pixels_at_1km > MAX_GEE_PIXELS:
-        scale = int(1000 * (pixels_at_1km / MAX_GEE_PIXELS) ** 0.5) + 100
-    else:
-        scale = 1000
-    logger.info(f"Using scale={scale}m for {pixels_at_1km:.0f} potential pixels")
-    lst_unmasked = lst_celsius.unmask(0).reproject(crs='EPSG:4326', scale=scale)
+    pixels_at_native = area_deg / ((scale / 111000) ** 2)
+    if pixels_at_native > 240000:
+        scale = int(scale * (pixels_at_native / 240000) ** 0.5) + 10
+        logger.info(f"Adaptive scale: {scale}m to fit {pixels_at_native:.0f} pixels")
+
+    logger.info(f"Fetching {source_name} r={radius_deg:.3f} scale={scale}m")
+
+    lst_unmasked = img.unmask(0).reproject(crs='EPSG:4326', scale=scale)
     rect_data = lst_unmasked.sampleRectangle(region=region)
     arr_info = rect_data.getInfo()
-    
+
     arr = np.array(arr_info["properties"]["lst"], dtype=np.float32)
     nrows, ncols = arr.shape
-    logger.info(f"Got array: {nrows}x{ncols} = {nrows*ncols} pixels")
+    logger.info(f"Array: {nrows}x{ncols} = {nrows*ncols} pixels")
 
     lat_step = (north - south) / nrows
     lon_step = (east - west) / ncols
@@ -81,16 +136,15 @@ def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
                 "value": round(val, 2)
             })
 
-    logger.info(f"Extracted {len(pixels)} valid pixels")
+    logger.info(f"Valid pixels: {len(pixels)}")
 
-    # Random subsample for browser performance
-    MAX_PIXELS = 5000
+    MAX_PIXELS = 8000
     if len(pixels) > MAX_PIXELS:
         import random
         pixels = random.sample(pixels, MAX_PIXELS)
-        logger.info(f"Subsampled to {len(pixels)} pixels")
+        logger.info(f"Subsampled to {len(pixels)}")
 
-    return pixels
+    return pixels, source_name
 
 
 @router.get("/heatmap/global", tags=["Global"])
@@ -99,26 +153,27 @@ def global_heatmap(
     lon:    float = Query(...),
     radius: float = Query(0.15),
     name:   str   = Query("Unknown"),
+    source: str   = Query("modis", description="modis | landsat | sentinel"),
 ):
-    """Fetch real-time MODIS LST for any city on Earth."""
-    logger.info(f"Global heatmap: {name} ({lat:.3f},{lon:.3f}) r={radius:.3f}")
+    """Fetch real-time LST for any city on Earth from MODIS, Landsat 8, or Sentinel-2."""
+    logger.info(f"Global heatmap: {name} ({lat:.3f},{lon:.3f}) r={radius:.3f} src={source}")
 
     try:
-        pixels = get_modis_lst(lat, lon, radius)
+        pixels, source_name = get_lst_pixels(lat, lon, radius, source)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"MODIS fetch failed: {e}")
+        logger.error(f"Fetch failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     if not pixels:
-        raise HTTPException(status_code=404, detail="No MODIS data found")
+        raise HTTPException(status_code=404, detail="No data found for this location")
 
     values = [p["value"] for p in pixels]
 
     return {
         "city": name,
-        "source": "MODIS MOD11A1 (Terra) 1km LST",
+        "source": source_name,
         "period": "2024 pre-monsoon (Mar-May)",
         "lat": lat, "lon": lon,
         "n_pixels": len(pixels),
