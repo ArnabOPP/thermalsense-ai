@@ -85,6 +85,12 @@ def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
 
     os.unlink(tif_path)
     logger.info(f"Extracted {len(pixels)} pixels")
+    # Subsample for browser performance — keep max 5000 evenly spaced pixels
+    MAX_PIXELS = 5000
+    if len(pixels) > MAX_PIXELS:
+        step = len(pixels) // MAX_PIXELS
+        pixels = pixels[::step]
+        logger.info(f"Subsampled to {len(pixels)} pixels for browser")
     return pixels
 
 
