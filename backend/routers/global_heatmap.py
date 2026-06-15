@@ -19,6 +19,8 @@ def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
     private_key = os.environ.get("EE_PRIVATE_KEY")
 
     if sa_email and private_key:
+        # Railway stores \n as literal \\n — fix it
+        private_key = private_key.replace('\\n', '\n')
         credentials = ee.ServiceAccountCredentials(sa_email, key_data=private_key)
         ee.Initialize(credentials, project=project)
     else:
