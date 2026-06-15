@@ -1,10 +1,10 @@
 """
 ThermalSense AI — Global Heatmap via MODIS
-Downloads full MODIS LST raster for any bbox and extracts all pixels.
+Uses GEE sampleRectangle for exhaustive pixel extraction without rasterio.
 """
 from fastapi import APIRouter, Query, HTTPException
 from loguru import logger
-import os, io, tempfile
+import os
 import numpy as np
 
 router = APIRouter()
@@ -25,72 +25,71 @@ def init_gee():
 
 
 def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
-    import requests
     ee = init_gee()
 
-    bbox_coords = [
-        lon - radius_deg, lat - radius_deg,
-        lon + radius_deg, lat + radius_deg
-    ]
-    bbox = ee.Geometry.BBox(*bbox_coords)
+    west  = lon - radius_deg
+    south = lat - radius_deg
+    east  = lon + radius_deg
+    north = lat + radius_deg
+
+    region = ee.Geometry.Rectangle([west, south, east, north])
 
     modis = (
         ee.ImageCollection("MODIS/061/MOD11A1")
         .filterDate("2024-03-01", "2024-05-31")
-        .filterBounds(bbox)
+        .filterBounds(region)
         .select("LST_Day_1km")
         .mean()
     )
 
-    lst_celsius = modis.multiply(0.02).subtract(273.15)
+    lst_celsius = modis.multiply(0.02).subtract(273.15).rename("lst")
 
-    # Download full raster
-    url = lst_celsius.getDownloadURL({
-        "scale": 1000,
-        "region": bbox,
-        "format": "GEO_TIFF",
-        "filePerBand": False,
-    })
+    # sampleRectangle returns a 2D array of all pixels
+    logger.info(f"Sampling rectangle radius={radius_deg:.3f} for ({lat:.2f},{lon:.2f})")
+    
+    # Adaptive scale — keep under GEE's 262144 pixel limit
+    MAX_GEE_PIXELS = 250000
+    area_deg = (radius_deg * 2) ** 2
+    pixels_at_1km = area_deg / (0.009 ** 2)
+    if pixels_at_1km > MAX_GEE_PIXELS:
+        scale = int(1000 * (pixels_at_1km / MAX_GEE_PIXELS) ** 0.5) + 100
+    else:
+        scale = 1000
+    logger.info(f"Using scale={scale}m for {pixels_at_1km:.0f} potential pixels")
+    lst_unmasked = lst_celsius.unmask(0).reproject(crs='EPSG:4326', scale=scale)
+    rect_data = lst_unmasked.sampleRectangle(region=region)
+    arr_info = rect_data.getInfo()
+    
+    arr = np.array(arr_info["properties"]["lst"], dtype=np.float32)
+    nrows, ncols = arr.shape
+    logger.info(f"Got array: {nrows}x{ncols} = {nrows*ncols} pixels")
 
-    logger.info(f"Downloading MODIS raster for {lat:.2f},{lon:.2f} r={radius_deg:.2f}...")
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
-
-    # Parse GeoTIFF
-    import rasterio
-    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
-        f.write(r.content)
-        tif_path = f.name
+    lat_step = (north - south) / nrows
+    lon_step = (east - west) / ncols
 
     pixels = []
-    with rasterio.open(tif_path) as src:
-        arr = src.read(1).astype(np.float32)
-        nodata = src.nodata
-        transform = src.transform
-        nrows, ncols = arr.shape
+    for row in range(nrows):
+        for col in range(ncols):
+            val = float(arr[row, col])
+            if not (10 < val < 65):
+                continue
+            px_lat = north - (row + 0.5) * lat_step
+            px_lon = west  + (col + 0.5) * lon_step
+            pixels.append({
+                "lat": round(px_lat, 5),
+                "lon": round(px_lon, 5),
+                "value": round(val, 2)
+            })
 
-        for row in range(nrows):
-            for col in range(ncols):
-                val = arr[row, col]
-                if nodata is not None and val == nodata:
-                    continue
-                if not (10 < val < 65):
-                    continue
-                lon_px, lat_px = transform * (col + 0.5, row + 0.5)
-                pixels.append({
-                    "lat": round(float(lat_px), 5),
-                    "lon": round(float(lon_px), 5),
-                    "value": round(float(val), 2)
-                })
+    logger.info(f"Extracted {len(pixels)} valid pixels")
 
-    os.unlink(tif_path)
-    logger.info(f"Extracted {len(pixels)} pixels")
-    # Subsample for browser performance using random sampling
+    # Random subsample for browser performance
     MAX_PIXELS = 5000
     if len(pixels) > MAX_PIXELS:
         import random
         pixels = random.sample(pixels, MAX_PIXELS)
-        logger.info(f"Subsampled to {len(pixels)} pixels for browser")
+        logger.info(f"Subsampled to {len(pixels)} pixels")
+
     return pixels
 
 
@@ -101,7 +100,7 @@ def global_heatmap(
     radius: float = Query(0.15),
     name:   str   = Query("Unknown"),
 ):
-    """Fetch real-time MODIS LST for any city on Earth — full raster coverage."""
+    """Fetch real-time MODIS LST for any city on Earth."""
     logger.info(f"Global heatmap: {name} ({lat:.3f},{lon:.3f}) r={radius:.3f}")
 
     try:
