@@ -41,7 +41,7 @@ console = Console()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-FEATURE_MATRIX_PATH = ROOT / "outputs" / "exports" / "kolkata" / "feature_matrix_kolkata_ALL.parquet"
+# Set dynamically based on --city arg
 OUTPUT_DIR = ROOT / "model" / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -258,6 +258,13 @@ def plot_scatter(train_metrics: dict, test_metrics: dict) -> None:
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--city", default="kolkata")
+    args, _ = parser.parse_known_args()
+    city = args.city
+
+    FEATURE_MATRIX_PATH = ROOT / "outputs" / "exports" / city / f"feature_matrix_{city}_ALL.parquet"
     console.print("\n[bold blue]ThermalSense AI — XGBoost Baseline[/bold blue]")
     console.print("[dim]Person B — Script 1 of 5[/dim]\n")
 

@@ -132,7 +132,9 @@ def scenario_ekw_restoration(df: pd.DataFrame, features: list, model) -> pd.Seri
     X_mod = df[features].copy()
 
     # EKW is in the eastern part of the bbox
-    eastern_mask = df["centroid_lon"] > 88.37
+    # Use relative position — eastern 30% of the city's bbox
+    lon_threshold = df["centroid_lon"].quantile(0.70)
+    eastern_mask = df["centroid_lon"] > lon_threshold
     degraded_mask = X_mod["ndwi"] < 0.0
 
     target_mask = eastern_mask & degraded_mask
@@ -163,13 +165,21 @@ def scenario_green_corridors(df: pd.DataFrame, features: list, model) -> pd.Seri
 
     # AJC Bose Road roughly: lat 22.54–22.56, lon 88.34–88.36
     # EM Bypass roughly: lat 22.50–22.58, lon 88.37–88.39
+    # Use relative positions — central corridor of the city
+    lat_mid = df["centroid_lat"].mean()
+    lon_mid = df["centroid_lon"].mean()
+    lat_span = df["centroid_lat"].std()
+    lon_span = df["centroid_lon"].std()
+
+    # Main north-south corridor
     ajc_mask = (
-        (df["centroid_lat"].between(22.535, 22.565)) &
-        (df["centroid_lon"].between(88.335, 88.365))
+        df["centroid_lat"].between(lat_mid - lat_span*0.3, lat_mid + lat_span*0.3) &
+        df["centroid_lon"].between(lon_mid - lon_span*0.2, lon_mid + lon_span*0.2)
     )
+    # Eastern bypass
     em_bypass_mask = (
-        (df["centroid_lat"].between(22.495, 22.585)) &
-        (df["centroid_lon"].between(88.368, 88.395))
+        df["centroid_lat"].between(lat_mid - lat_span*0.5, lat_mid + lat_span*0.5) &
+        df["centroid_lon"].between(lon_mid + lon_span*0.1, lon_mid + lon_span*0.5)
     )
     corridor_mask = ajc_mask | em_bypass_mask
 
