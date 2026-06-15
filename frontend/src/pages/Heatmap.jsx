@@ -81,13 +81,19 @@ export default function Heatmap() {
 
   function selectSuggestion(item) {
     const bbox = item.boundingbox
-    const center = [parseFloat(item.lat), parseFloat(item.lon)]
     const latSpan = parseFloat(bbox[1]) - parseFloat(bbox[0])
+    const lonSpan = parseFloat(bbox[3]) - parseFloat(bbox[2])
+    const radius = Math.max(latSpan, lonSpan) / 2 * 1.1  // cover full boundary
+    const center = [parseFloat(item.lat), parseFloat(item.lon)]
     const zoom = latSpan > 1 ? 9 : latSpan > 0.3 ? 11 : 12
     setSelectedCity({
       name: item.display_name.split(',')[0],
       center, zoom,
       boundary: item.geojson,
+      radius: Math.max(
+        parseFloat(bbox[1]) - parseFloat(bbox[0]),
+        parseFloat(bbox[3]) - parseFloat(bbox[2])
+      ) / 2 * 1.1
     })
     setSuggestions([])
     setSearchQuery(item.display_name.split(',')[0])
@@ -99,7 +105,7 @@ export default function Heatmap() {
     setLoading(true)
     setRawData(null)
     setFilteredPixels([])
-    getGlobalHeatmap(selectedCity.center[0], selectedCity.center[1], selectedCity.name)
+    getGlobalHeatmap(selectedCity.center[0], selectedCity.center[1], selectedCity.name, selectedCity.radius)
       .then(data => setRawData(data))
       .catch(console.error)
       .finally(() => setLoading(false))
@@ -227,7 +233,7 @@ export default function Heatmap() {
             </div>
           )}
           {filteredPixels.map((p, i) => (
-            <CircleMarker key={i} center={[p.lat, p.lon]} radius={5}
+            <CircleMarker key={i} center={[p.lat, p.lon]} radius={4}
               pathOptions={{ fillColor: lstToColor(p.value, vmin, vmax),
                 fillOpacity: 0.85, color: 'transparent', weight: 0 }}>
               <Tooltip>

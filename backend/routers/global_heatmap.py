@@ -43,11 +43,16 @@ def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
     )
 
     lst_celsius = modis.multiply(0.02).subtract(273.15)
+    lat_span = radius_deg * 2
+    lon_span = radius_deg * 2
+    area_sq_deg = lat_span * lon_span
+    # At 1km MODIS resolution, ~1 pixel per 0.009 degrees
+    pixels_needed = min(int(area_sq_deg / (0.009 * 0.009)), 5000)
 
     points = lst_celsius.sample(
         region=bbox,
         scale=1000,
-        numPixels=2000,
+        numPixels=pixels_needed,
         seed=42,
         geometries=True
     )
