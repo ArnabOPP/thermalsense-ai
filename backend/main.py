@@ -23,8 +23,9 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _XGB_PATH = _ROOT / "model" / "outputs" / "xgb_model.pkl"
+_KOL_PATH = _ROOT / "outputs" / "exports" / "kolkata" / "feature_matrix_kolkata_clipped.parquet"
 
-if not _XGB_PATH.exists():
+if not _XGB_PATH.exists() or not _KOL_PATH.exists():
     print("Models not found locally — downloading from HuggingFace...", flush=True)
     try:
         from huggingface_hub import snapshot_download
