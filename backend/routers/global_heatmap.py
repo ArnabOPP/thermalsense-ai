@@ -1,38 +1,38 @@
 """
 ThermalSense AI — Global Heatmap via MODIS
-Fetches real-time LST for any city bbox from Google Earth Engine MODIS MOD11A1.
+Downloads full MODIS LST raster for any bbox and extracts all pixels.
 """
 from fastapi import APIRouter, Query, HTTPException
 from loguru import logger
-import os
+import os, io, tempfile
 import numpy as np
 
 router = APIRouter()
 
 
-def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
-    """Fetch MODIS LST for a bbox around lat/lon using GEE."""
+def init_gee():
     import ee
-
     project = os.environ.get("EE_PROJECT_ID", "thermalsense")
     sa_email = os.environ.get("EE_SERVICE_ACCOUNT")
     private_key = os.environ.get("EE_PRIVATE_KEY")
-
     if sa_email and private_key:
-        # Railway stores \n as literal \\n — fix it
         private_key = private_key.replace('\\n', '\n')
         credentials = ee.ServiceAccountCredentials(sa_email, key_data=private_key)
         ee.Initialize(credentials, project=project)
     else:
-        try:
-            ee.Initialize(project=project)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"GEE auth failed: {e}")
+        ee.Initialize(project=project)
+    return ee
 
-    bbox = ee.Geometry.BBox(
+
+def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
+    import requests
+    ee = init_gee()
+
+    bbox_coords = [
         lon - radius_deg, lat - radius_deg,
         lon + radius_deg, lat + radius_deg
-    )
+    ]
+    bbox = ee.Geometry.BBox(*bbox_coords)
 
     modis = (
         ee.ImageCollection("MODIS/061/MOD11A1")
@@ -43,44 +43,60 @@ def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
     )
 
     lst_celsius = modis.multiply(0.02).subtract(273.15)
-    lat_span = radius_deg * 2
-    lon_span = radius_deg * 2
-    area_sq_deg = lat_span * lon_span
-    # At 1km MODIS resolution, ~1 pixel per 0.009 degrees
-    pixels_needed = min(int(area_sq_deg / (0.009 * 0.009)), 5000)
 
-    points = lst_celsius.sample(
-        region=bbox,
-        scale=1000,
-        numPixels=pixels_needed,
-        seed=42,
-        geometries=True
-    )
+    # Download full raster
+    url = lst_celsius.getDownloadURL({
+        "scale": 1000,
+        "region": bbox,
+        "format": "GEO_TIFF",
+        "filePerBand": False,
+    })
 
-    features = points.getInfo()["features"]
+    logger.info(f"Downloading MODIS raster for {lat:.2f},{lon:.2f} r={radius_deg:.2f}...")
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
+
+    # Parse GeoTIFF
+    import rasterio
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+        f.write(r.content)
+        tif_path = f.name
+
     pixels = []
-    for f in features:
-        val = f["properties"].get("LST_Day_1km")
-        coords = f["geometry"]["coordinates"]
-        if val is not None and 10 < val < 65:
-            pixels.append({
-                "lat": round(coords[1], 5),
-                "lon": round(coords[0], 5),
-                "value": round(float(val), 2)
-            })
+    with rasterio.open(tif_path) as src:
+        arr = src.read(1).astype(np.float32)
+        nodata = src.nodata
+        transform = src.transform
+        nrows, ncols = arr.shape
 
+        for row in range(nrows):
+            for col in range(ncols):
+                val = arr[row, col]
+                if nodata is not None and val == nodata:
+                    continue
+                if not (10 < val < 65):
+                    continue
+                lon_px, lat_px = transform * (col + 0.5, row + 0.5)
+                pixels.append({
+                    "lat": round(float(lat_px), 5),
+                    "lon": round(float(lon_px), 5),
+                    "value": round(float(val), 2)
+                })
+
+    os.unlink(tif_path)
+    logger.info(f"Extracted {len(pixels)} pixels")
     return pixels
 
 
 @router.get("/heatmap/global", tags=["Global"])
 def global_heatmap(
-    lat:    float = Query(..., description="City center latitude"),
-    lon:    float = Query(..., description="City center longitude"),
-    radius: float = Query(0.15, description="Radius in degrees (~15km)"),
-    name:   str   = Query("Unknown", description="City name for logging"),
+    lat:    float = Query(...),
+    lon:    float = Query(...),
+    radius: float = Query(0.15),
+    name:   str   = Query("Unknown"),
 ):
-    """Fetch real-time MODIS LST for any city on Earth."""
-    logger.info(f"Global heatmap: {name} ({lat:.3f}, {lon:.3f})")
+    """Fetch real-time MODIS LST for any city on Earth — full raster coverage."""
+    logger.info(f"Global heatmap: {name} ({lat:.3f},{lon:.3f}) r={radius:.3f}")
 
     try:
         pixels = get_modis_lst(lat, lon, radius)
@@ -91,7 +107,7 @@ def global_heatmap(
         raise HTTPException(status_code=500, detail=str(e))
 
     if not pixels:
-        raise HTTPException(status_code=404, detail="No MODIS data found for this location")
+        raise HTTPException(status_code=404, detail="No MODIS data found")
 
     values = [p["value"] for p in pixels]
 
@@ -99,8 +115,7 @@ def global_heatmap(
         "city": name,
         "source": "MODIS MOD11A1 (Terra) 1km LST",
         "period": "2024 pre-monsoon (Mar-May)",
-        "lat": lat,
-        "lon": lon,
+        "lat": lat, "lon": lon,
         "n_pixels": len(pixels),
         "value_min": round(float(np.min(values)), 2),
         "value_max": round(float(np.max(values)), 2),
