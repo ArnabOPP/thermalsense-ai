@@ -80,21 +80,19 @@ export default function Heatmap() {
   useEffect(() => { searchCities(searchQuery) }, [searchQuery])
 
   function selectSuggestion(item) {
-    const bbox = item.boundingbox
-    const latSpan = parseFloat(bbox[1]) - parseFloat(bbox[0])
-    const lonSpan = parseFloat(bbox[3]) - parseFloat(bbox[2])
-    const radius = Math.max(latSpan, lonSpan) / 2 * 1.1  // cover full boundary
-    const center = [parseFloat(item.lat), parseFloat(item.lon)]
-    const zoom = latSpan > 1 ? 9 : latSpan > 0.3 ? 11 : 12
-    setSelectedCity({
-      name: item.display_name.split(',')[0],
-      center, zoom,
-      boundary: item.geojson,
-      radius: Math.max(
-        parseFloat(bbox[1]) - parseFloat(bbox[0]),
-        parseFloat(bbox[3]) - parseFloat(bbox[2])
-      ) / 2 * 1.1
-    })
+      const bbox = item.boundingbox
+      const latSpan = parseFloat(bbox[1]) - parseFloat(bbox[0])
+      const lonSpan = parseFloat(bbox[3]) - parseFloat(bbox[2])
+      const center = [parseFloat(item.lat), parseFloat(item.lon)]
+      const zoom = latSpan > 1 ? 9 : latSpan > 0.3 ? 11 : 12
+      // Minimum 0.3 radius so small cities get enough pixels
+      const radius = Math.max(Math.max(latSpan, lonSpan) / 2 * 1.2, 0.3)
+      setSelectedCity({
+        name: item.display_name.split(',')[0],
+        center, zoom,
+        boundary: item.geojson,
+        radius,
+      })
     setSuggestions([])
     setSearchQuery(item.display_name.split(',')[0])
   }
