@@ -79,15 +79,16 @@ const SOURCES = [
 ]
 
 export default function Heatmap() {
-  const [searchQuery, setSearchQuery] = useState('')
-  const [suggestions, setSuggestions] = useState([])
-  const [searching, setSearching]     = useState(false)
+  const [searchQuery, setSearchQuery]   = useState('')
+  const [suggestions, setSuggestions]   = useState([])
+  const [searching, setSearching]       = useState(false)
   const [selectedCity, setSelectedCity] = useState(null)
-  const [source, setSource]           = useState('modis')
-  const [rawData, setRawData]         = useState(null)
+  const [source, setSource]             = useState('modis')
+  const [clipBoundary, setClipBoundary] = useState(true)
+  const [rawData, setRawData]           = useState(null)
   const [filteredPixels, setFilteredPixels] = useState([])
-  const [loading, setLoading]         = useState(false)
-  const searchTimeout                 = useRef(null)
+  const [loading, setLoading]           = useState(false)
+  const searchTimeout                   = useRef(null)
 
   const searchCities = useCallback((q) => {
     if (!q || q.length < 2) { setSuggestions([]); return }
@@ -112,7 +113,7 @@ export default function Heatmap() {
     const lonSpan = parseFloat(bbox[3]) - parseFloat(bbox[2])
     const center = [parseFloat(item.lat), parseFloat(item.lon)]
     const zoom = latSpan > 1 ? 9 : latSpan > 0.3 ? 11 : 12
-    const radius = Math.max(Math.max(latSpan, lonSpan) / 2 * 1.2, 0.3)
+    const radius = Math.max(Math.max(latSpan, lonSpan) / 2 * 1.2, 0.5)
     setSelectedCity({
       name: item.display_name.split(',')[0],
       center, zoom,
@@ -129,7 +130,6 @@ export default function Heatmap() {
     setLoading(true)
     setRawData(null)
     setFilteredPixels([])
-    // Pass source to API
     const API_BASE = import.meta.env.VITE_API_URL || 'https://thermalsense-ai-production.up.railway.app'
     fetch(`${API_BASE}/heatmap/global?lat=${selectedCity.center[0]}&lon=${selectedCity.center[1]}&name=${encodeURIComponent(selectedCity.name)}&radius=${selectedCity.radius}&source=${source}`)
       .then(r => r.json())
@@ -138,18 +138,18 @@ export default function Heatmap() {
       .finally(() => setLoading(false))
   }, [selectedCity, source])
 
-  // Clip to boundary
+  // Clip to boundary or show all
   useEffect(() => {
     if (!rawData?.pixels) return
     const ring = selectedCity?.boundary ? getOuterRing(selectedCity.boundary) : null
-    if (!ring) {
+    if (!clipBoundary || !ring) {
       setFilteredPixels(rawData.pixels.filter(p => p.value !== null))
       return
     }
     setFilteredPixels(
       rawData.pixels.filter(p => p.value !== null && pointInPolygon(p.lat, p.lon, ring))
     )
-  }, [rawData, selectedCity])
+  }, [rawData, selectedCity, clipBoundary])
 
   const vmin = rawData?.value_min ?? 30
   const vmax = rawData?.value_max ?? 55
@@ -208,36 +208,63 @@ export default function Heatmap() {
           )}
         </div>
 
-        {/* Source selector */}
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          {SOURCES.map(src => (
-            <button
-              key={src.id}
-              onClick={() => setSource(src.id)}
-              title={src.description}
-              style={{
-                display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
-                padding: '8px 14px', borderRadius: 8, cursor: 'pointer',
-                border: `1px solid ${source === src.id ? src.color : 'var(--border)'}`,
-                background: source === src.id ? `${src.color}20` : 'var(--bg-deep)',
-                transition: 'all 0.15s',
-              }}
-            >
-              <div style={{ fontSize: 12, fontWeight: 600,
-                color: source === src.id ? src.color : 'var(--text-sec)' }}>
-                {src.icon} {src.label}
-              </div>
-              <div style={{ fontSize: 10, color: 'var(--text-sec)', marginTop: 2 }}>
-                {src.sublabel}
-              </div>
-            </button>
-          ))}
+        {/* Source selector + Clip toggle row */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
+
+          {/* Source buttons */}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {SOURCES.map(src => (
+              <button
+                key={src.id}
+                onClick={() => setSource(src.id)}
+                title={src.description}
+                style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
+                  padding: '8px 14px', borderRadius: 8, cursor: 'pointer',
+                  border: `1px solid ${source === src.id ? src.color : 'var(--border)'}`,
+                  background: source === src.id ? `${src.color}20` : 'var(--bg-deep)',
+                  transition: 'all 0.15s',
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 600,
+                  color: source === src.id ? src.color : 'var(--text-sec)' }}>
+                  {src.icon} {src.label}
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-sec)', marginTop: 2 }}>
+                  {src.sublabel}
+                </div>
+              </button>
+            ))}
+          </div>
+
+          {/* Clip boundary toggle */}
+          <button
+            onClick={() => setClipBoundary(c => !c)}
+            title={clipBoundary ? 'Click to show all pixels in bbox' : 'Click to clip to boundary'}
+            style={{
+              display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
+              padding: '8px 14px', borderRadius: 8, cursor: 'pointer',
+              border: `1px solid ${clipBoundary ? '#a855f7' : 'var(--border)'}`,
+              background: clipBoundary ? '#a855f720' : 'var(--bg-deep)',
+              transition: 'all 0.15s',
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 600,
+              color: clipBoundary ? '#a855f7' : 'var(--text-sec)' }}>
+              {clipBoundary ? '✂️ Clip: ON' : '⬜ Clip: OFF'}
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-sec)', marginTop: 2 }}>
+              {clipBoundary ? 'Inside boundary' : 'Full bbox'}
+            </div>
+          </button>
+
         </div>
 
         {/* Source description */}
         {activeSource && (
           <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-sec)' }}>
             {activeSource.description}
+            {!clipBoundary && <span style={{ color: '#a855f7', marginLeft: 8 }}>· Showing full bbox (no clipping)</span>}
           </div>
         )}
       </div>
@@ -296,7 +323,7 @@ export default function Heatmap() {
             </div>
           )}
           {filteredPixels.map((p, i) => (
-            <CircleMarker key={i} center={[p.lat, p.lon]} radius={4}
+            <CircleMarker key={i} center={[p.lat, p.lon]} radius={7}
               pathOptions={{ fillColor: lstToColor(p.value, vmin, vmax),
                 fillOpacity: 0.85, color: 'transparent', weight: 0 }}>
               <Tooltip>
