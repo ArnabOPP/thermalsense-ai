@@ -15,15 +15,17 @@ def get_modis_lst(lat: float, lon: float, radius_deg: float = 0.15):
     import ee
 
     project = os.environ.get("EE_PROJECT_ID", "thermalsense")
+    sa_email = os.environ.get("EE_SERVICE_ACCOUNT")
+    private_key = os.environ.get("EE_PRIVATE_KEY")
 
-    try:
-        ee.Initialize(project=project)
-    except Exception:
+    if sa_email and private_key:
+        credentials = ee.ServiceAccountCredentials(sa_email, key_data=private_key)
+        ee.Initialize(credentials, project=project)
+    else:
         try:
-            ee.Authenticate(auth_mode="service_account")
             ee.Initialize(project=project)
-        except Exception as auth_err:
-            raise HTTPException(status_code=500, detail=f"GEE auth failed: {auth_err}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"GEE auth failed: {e}")
 
     bbox = ee.Geometry.BBox(
         lon - radius_deg, lat - radius_deg,
