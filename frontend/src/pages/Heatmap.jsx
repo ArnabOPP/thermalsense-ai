@@ -1,740 +1,1210 @@
-// ThermalSense AI — Spatial Heatmap
-// Sidebar layout + single-date + compare mode (side-by-side, fade, swipe) + fixed swipe
+// ThermalSense AI — Spatial Heatmap v3.0
+// Multi-city · NASA GIBS daily imagery · Synced compare · UHI Score · Hotspots
+// Pixel rectangles · Color scale ticks · Loading skeleton · A/B stats · Narrative · Export
 
-import { useState, useEffect, useRef, useCallback } from 'react'
-import { MapContainer, TileLayer, CircleMarker, Tooltip, GeoJSON, useMap } from 'react-leaflet'
+import { useState, useEffect, useRef, useMemo } from 'react'
+import { MapContainer, TileLayer, CircleMarker, Tooltip, GeoJSON, useMap, useMapEvents } from 'react-leaflet'
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
-
-function lstToColor(value, min, max) {
-  const t = Math.max(0, Math.min(1, (value - min) / (max - min)))
-  if (t < 0.25) { const s = t/0.25; return `rgb(${Math.round(59+s*6)},${Math.round(130+s*76)},${Math.round(246-s*40)})` }
-  if (t < 0.50) { const s = (t-0.25)/0.25; return `rgb(${Math.round(65+s*179)},${Math.round(206-s*21)},${Math.round(206-s*177)})` }
-  if (t < 0.75) { const s = (t-0.5)/0.25; return `rgb(244,${Math.round(185-s*88)},${Math.round(29-s*29)})` }
-  const s = (t-0.75)/0.25; return `rgb(${Math.round(244-s*5)},${Math.round(97-s*97)},0)`
+// ─── pure helpers ─────────────────────────────────────────────────────────────
+function lstToColor(v,mn,mx){
+  const t=Math.max(0,Math.min(1,(v-mn)/(mx-mn)))
+  if(t<0.25){const s=t/0.25;return`rgb(${Math.round(59+s*6)},${Math.round(130+s*76)},${Math.round(246-s*40)})`}
+  if(t<0.50){const s=(t-0.25)/0.25;return`rgb(${Math.round(65+s*179)},${Math.round(206-s*21)},${Math.round(206-s*177)})`}
+  if(t<0.75){const s=(t-0.5)/0.25;return`rgb(244,${Math.round(185-s*88)},${Math.round(29-s*29)})`}
+  const s=(t-0.75)/0.25;return`rgb(${Math.round(244-s*5)},${Math.round(97-s*97)},0)`
 }
-
-function pointInPolygon(lat, lon, ring) {
-  let inside = false
-  for (let i=0, j=ring.length-1; i<ring.length; j=i++) {
+function pip(lat,lon,ring){
+  let inside=false
+  for(let i=0,j=ring.length-1;i<ring.length;j=i++){
     const xi=ring[i][0],yi=ring[i][1],xj=ring[j][0],yj=ring[j][1]
-    if (((yi>lat)!==(yj>lat))&&(lon<(xj-xi)*(lat-yi)/(yj-yi)+xi)) inside=!inside
+    if(((yi>lat)!==(yj>lat))&&(lon<(xj-xi)*(lat-yi)/(yj-yi)+xi))inside=!inside
   }
   return inside
 }
-
-function getOuterRing(geometry) {
-  if (!geometry) return null
-  if (geometry.type==='Polygon') return geometry.coordinates[0]
-  if (geometry.type==='MultiPolygon') {
-    let largest=[]
-    for (const poly of geometry.coordinates) if (poly[0].length>largest.length) largest=poly[0]
-    return largest
-  }
+function outerRing(geo){
+  if(!geo)return null
+  if(geo.type==='Polygon')return geo.coordinates[0]
+  if(geo.type==='MultiPolygon'){let b=[];for(const p of geo.coordinates)if(p[0].length>b.length)b=p[0];return b}
   return null
 }
-
-function maxDate() {
-  const d = new Date()
-  d.setDate(d.getDate() - 3)
-  return d.toISOString().split('T')[0]
+function todayMinus3(){const d=new Date();d.setDate(d.getDate()-3);return d.toISOString().split('T')[0]}
+function closestPixel(pixels,lat,lon,maxDist=0.08){
+  let best=null,bestD=Infinity
+  for(const p of pixels){const d=Math.hypot(p.lat-lat,p.lon-lon);if(d<bestD&&d<maxDist){bestD=d;best=p}}
+  return best
+}
+function buildGibsUrl(date){
+  return`https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/${date}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`
 }
 
-function MapFlyTo({ center, zoom }) {
-  const map = useMap()
-  useEffect(() => { if (center) map.flyTo(center, zoom, { duration: 1.2 }) }, [center, zoom])
-  return null
+// ── UHI score: mean of top-25% pixels (urban) minus bottom-25% (rural/veg) ──
+function computeUHI(pixels){
+  if(!pixels||pixels.length<10)return null
+  const sorted=[...pixels].sort((a,b)=>a.value-b.value)
+  const q=Math.floor(sorted.length/4)
+  const rural=sorted.slice(0,q).reduce((s,p)=>s+p.value,0)/q
+  const urban=sorted.slice(-q).reduce((s,p)=>s+p.value,0)/q
+  return(urban-rural).toFixed(1)
 }
 
-const SOURCES = [
-  { id:'modis',    label:'MODIS',      sublabel:'1km · Global · Fast',   icon:'🛰', color:'#6366f1', minDate:'2000-02-24' },
-  { id:'landsat',  label:'Landsat 8',  sublabel:'100m · Cities · ~15s',  icon:'🌍', color:'#f97316', minDate:'2013-04-11' },
-  { id:'sentinel', label:'Sentinel-2', sublabel:'10m · Cities · ~30s',   icon:'🔬', color:'#22c55e', minDate:'2015-06-23' },
+// ── percentile threshold for hotspot detection ────────────────────────────────
+function p90(pixels){
+  if(!pixels||!pixels.length)return Infinity
+  const sorted=[...pixels].map(p=>p.value).sort((a,b)=>a-b)
+  return sorted[Math.floor(sorted.length*0.9)]
+}
+
+// ── auto narrative ────────────────────────────────────────────────────────────
+function buildNarrative(cityList,cityRaw,cityPixels,compare,cmpRawMap,cmpDate,date,source){
+  const parts=[]
+  cityList.forEach(c=>{
+    const rd=cityRaw[c.slotId];const px=cityPixels[c.slotId]||[]
+    if(!rd)return
+    const uhi=computeUHI(px)
+    const thresh=p90(px)
+    const hotspots=px.filter(p=>p.value>=thresh).length
+    const season=getSeason(date)
+    parts.push(`${c.name} shows a mean LST of ${rd.value_mean.toFixed(1)}°C in ${season} (${date}), peaking at ${rd.value_max.toFixed(1)}°C. `+
+      (uhi?`UHI intensity: ${uhi}°C (urban surfaces ${uhi}°C hotter than vegetated areas). `:'') +
+      (hotspots?`${hotspots} critical hotspots detected above 90th percentile (≥${thresh.toFixed(1)}°C).`:'')
+    )
+    if(compare&&cmpRawMap[c.slotId]){
+      const rdB=cmpRawMap[c.slotId]
+      const delta=(rd.value_mean-rdB.value_mean).toFixed(1)
+      const seasonB=getSeason(cmpDate)
+      parts.push(` Compared to ${seasonB} (${cmpDate}): surface is ${Math.abs(delta)}°C ${delta>0?'hotter':'cooler'} — a seasonal swing driven by ${delta>0?'pre-monsoon bare soil heating and reduced vegetation cover':'monsoon cooling, increased soil moisture and cloud shading'}.`)
+    }
+  })
+  return parts.join(' ')
+}
+function getSeason(d){
+  if(!d)return''
+  const m=parseInt(d.split('-')[1])
+  if(m<=2||m===12)return'winter'
+  if(m<=5)return'pre-monsoon'
+  if(m<=9)return'monsoon'
+  return'post-monsoon'
+}
+
+// ── CSV export ────────────────────────────────────────────────────────────────
+function exportCSV(cityList,cityPixels,date,source){
+  const rows=['city,lat,lon,lst_c,date,source']
+  cityList.forEach(c=>{
+    (cityPixels[c.slotId]||[]).forEach(p=>{
+      rows.push(`${c.name},${p.lat},${p.lon},${p.value},${date},${source}`)
+    })
+  })
+  const blob=new Blob([rows.join('\n')],{type:'text/csv'})
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob)
+  a.download=`thermalsense_lst_${date}.csv`;a.click()
+}
+
+// ── PNG export via html2canvas-style canvas ───────────────────────────────────
+function exportPNG(){
+  const el=document.getElementById('ts-map-area')
+  if(!el){alert('Map not ready');return}
+  import('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js').then(()=>{
+    window.html2canvas(el,{useCORS:true,scale:2}).then(canvas=>{
+      const a=document.createElement('a');a.href=canvas.toDataURL('image/png')
+      a.download='thermalsense_heatmap.png';a.click()
+    })
+  }).catch(()=>alert('Screenshot: use browser Print > Save as PDF or right-click map > Save Image'))
+}
+
+// ─── constants ────────────────────────────────────────────────────────────────
+const CITY_COLORS=['#6366f1','#f97316','#22c55e','#ec4899','#eab308','#06b6d4']
+const SOURCES=[
+  {id:'modis',   label:'MODIS',     sub:'1km · Global · Fast',  icon:'🛰',color:'#6366f1',min:'2000-02-24'},
+  {id:'landsat', label:'Landsat 8', sub:'100m · Cities · ~15s', icon:'🌍',color:'#f97316',min:'2013-04-11'},
+  {id:'sentinel',label:'Sentinel-2',sub:'10m · Cities · ~30s',  icon:'🔬',color:'#22c55e',min:'2015-06-23'},
 ]
+const TILE_LAYERS={
+  dark:   {url:'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',   attr:'&copy; CARTO',                    label:'Dark',     icon:'🌑', note:null},
+  satellite:{url:'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr:'&copy; Esri', label:'Satellite',icon:'🌐', note:'Static mosaic — not date-specific'},
+  gibs:   {url:null,                                                               attr:'&copy; NASA GIBS · MODIS Terra',  label:'NASA Daily',icon:'🛰', note:'Actual satellite footage for selected date'},
+  hybrid: {url:'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr:'&copy; Esri', label:'Hybrid',   icon:'🗺', labelUrl:'https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png', note:'Static + labels'},
+}
+const API=import.meta.env.VITE_API_URL||'https://thermalsense-ai-production.up.railway.app'
 
-const API_BASE = import.meta.env.VITE_API_URL || 'https://thermalsense-ai-production.up.railway.app'
+// ─── Leaflet components ───────────────────────────────────────────────────────
+function MapFlyTo({center,zoom}){
+  const map=useMap()
+  useEffect(()=>{if(center)map.flyTo(center,zoom,{duration:1.2})},[center,zoom])
+  return null
+}
+function MapSync({sourceRef,targetRef}){
+  const map=useMap()
+  useEffect(()=>{sourceRef.current=map},[map])
+  useEffect(()=>{
+    if(!map)return
+    const g={active:false}
+    const sync=()=>{if(g.active||!targetRef.current)return;g.active=true;targetRef.current.setView(map.getCenter(),map.getZoom(),{animate:false,noMoveStart:true});g.active=false}
+    map.on('move zoom',sync);return()=>map.off('move zoom',sync)
+  },[map,targetRef])
+  return null
+}
+function MapHoverEmitter({onHover}){
+  useMapEvents({mousemove(e){onHover(e.latlng.lat,e.latlng.lng)},mouseout(){onHover(null,null)}})
+  return null
+}
+function SyncedTooltipInner({lat,lon,value,cityName,color,label}){
+  const map=useMap()
+  const [pos,setPos]=useState(null)
+  useEffect(()=>{
+    if(!map||lat==null)return
+    const update=()=>{const p=map.latLngToContainerPoint([lat,lon]);setPos({x:p.x,y:p.y})}
+    update();map.on('move zoom',update);return()=>map.off('move zoom',update)
+  },[map,lat,lon])
+  if(!pos)return null
+  return(
+    <div style={{
+      position:'absolute',left:pos.x+14,top:pos.y-56,
+      background:'rgba(255,255,255,0.97)',
+      border:`2px solid ${color}`,
+      borderRadius:8,padding:'7px 11px',pointerEvents:'none',
+      zIndex:2500,fontFamily:'monospace',fontSize:11,whiteSpace:'nowrap',
+      boxShadow:'0 4px 20px rgba(0,0,0,0.35)',
+      // small triangle pointer
+    }}>
+      <div style={{fontWeight:700,color,marginBottom:3,fontSize:10,textTransform:'uppercase',letterSpacing:'0.05em'}}>
+        {cityName} · {label}
+      </div>
+      <div style={{color:'#1e293b',fontSize:13,fontWeight:700}}>
+        LST: <span style={{color: color}}>{value.toFixed(1)}°C</span>
+      </div>
+      <div style={{color:'#64748b',fontSize:9,marginTop:3}}>
+        {lat.toFixed(4)}°N {lon.toFixed(4)}°E
+      </div>
+    </div>
+  )
+}
+function SyncedHoverLayer({hoverLatLon,pixels,cityList,label,color}){
+  if(!hoverLatLon||hoverLatLon[0]==null)return null
+  const [lat,lon]=hoverLatLon
+  let best=null,bestCity=null,bestD=Infinity
+  cityList.forEach(c=>{
+    const px=pixels[c.slotId]||[]
+    const p=closestPixel(px,lat,lon,0.08)
+    if(p){const d=Math.hypot(p.lat-lat,p.lon-lon);if(d<bestD){bestD=d;best=p;bestCity=c}}
+  })
+  if(!best)return null
+  return <SyncedTooltipInner lat={best.lat} lon={best.lon} value={best.value} cityName={bestCity?.name} color={bestCity?.color||color} label={label}/>
+}
+function BaseTileLayer({tileMode,date}){
+  const layer=TILE_LAYERS[tileMode]||TILE_LAYERS.dark
+  const url=tileMode==='gibs'?buildGibsUrl(date||todayMinus3()):layer.url
+  return(<><TileLayer url={url} attribution={layer.attr} maxNativeZoom={tileMode==='gibs'?9:18} maxZoom={18}/>{layer.labelUrl&&<TileLayer url={layer.labelUrl} attribution="" zIndex={500}/>}</>)
+}
+function TileToggleButton({tileMode,setTileMode}){
+  const modes=['dark','satellite','gibs','hybrid']
+  const [open,setOpen]=useState(false)
+  const icons={dark:'🌑',satellite:'🌐',gibs:'🛰',hybrid:'🗺'}
+  const labels={dark:'Dark',satellite:'Satellite',gibs:'NASA Daily',hybrid:'Hybrid'}
+  return(
+    <div style={{position:'absolute',bottom:40,right:8,zIndex:1500}}>
+      {open&&(
+        <div style={{position:'absolute',bottom:38,right:0,background:'rgba(10,14,26,0.97)',
+          border:'1px solid #1e293b',borderRadius:10,overflow:'hidden',whiteSpace:'nowrap',
+          boxShadow:'0 8px 24px rgba(0,0,0,0.6)',minWidth:130}}>
+          {modes.map((m,i)=>(
+            <div key={m} onClick={()=>{setTileMode(m);setOpen(false)}}
+              style={{padding:'8px 14px',cursor:'pointer',fontSize:12,display:'flex',alignItems:'center',gap:8,
+                background:tileMode===m?'#6366f115':'transparent',
+                color:tileMode===m?'#818cf8':'#cbd5e1',
+                borderBottom:i<modes.length-1?'1px solid #1e293b22':''}}
+              onMouseEnter={e=>e.currentTarget.style.background='#1e293b'}
+              onMouseLeave={e=>e.currentTarget.style.background=tileMode===m?'#6366f115':'transparent'}>
+              <span>{icons[m]}</span>{labels[m]}
+            </div>
+          ))}
+        </div>
+      )}
+      <button onClick={()=>setOpen(o=>!o)} title="Switch map layer"
+        style={{width:34,height:34,borderRadius:8,cursor:'pointer',
+          background:'rgba(10,14,26,0.92)',border:'1px solid #334155',
+          color:'#e2e8f0',fontSize:16,display:'flex',alignItems:'center',
+          justifyContent:'center',boxShadow:'0 2px 8px rgba(0,0,0,0.4)'}}>
+        {icons[tileMode]}
+      </button>
+    </div>
+  )
+}
 
-// ─── CitySearchSlot ───────────────────────────────────────────────────────────
+// ── Loading skeleton ──────────────────────────────────────────────────────────
+function MapSkeleton(){
+  return(
+    <div style={{position:'absolute',inset:0,background:'#0a0e1a',zIndex:800,
+      display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:16}}>
+      <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:12}}>
+        <div style={{width:48,height:48,borderRadius:'50%',border:'3px solid #6366f1',
+          borderTopColor:'transparent',animation:'spin 0.8s linear infinite'}}/>
+        <div style={{color:'#6366f1',fontSize:13,fontFamily:'monospace',letterSpacing:'0.05em'}}>
+          Fetching satellite data…
+        </div>
+        <div style={{color:'#475569',fontSize:11}}>Querying NASA Earth Engine</div>
+      </div>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:0.4}50%{opacity:1}}`}</style>
+    </div>
+  )
+}
 
-function CitySearchSlot({ color, onCitySelected }) {
-  const [query, setQuery]       = useState('')
-  const [suggestions, setSugg]  = useState([])
-  const [searching, setSearch]  = useState(false)
-  const timeout = useRef(null)
+// ── PixelLayer — zoom-aware CircleMarker, no drift, no gaps ───────────────────
+// Uses Leaflet's native SVG CircleMarker so Leaflet handles all coordinate
+// transforms internally — zero drift on pan/zoom, works perfectly in side-by-side.
+// Radius scales with zoom level so pixels fill the map with minimal gaps.
+// onPixelClick: click any pixel to open time series modal.
+function PixelLayer({pixels,vmin,vmax,thresh,showHotspots,opacity=0.88,onPixelClick}){
+  const map=useMap()
+  const [zoom,setZoom]=useState(()=>map.getZoom())
 
-  const search = useCallback((q) => {
-    if (!q || q.length < 2) { setSugg([]); return }
-    clearTimeout(timeout.current)
-    timeout.current = setTimeout(async () => {
-      setSearch(true)
-      try {
-        const r = await fetch(
-          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&polygon_geojson=1&limit=5&featuretype=city`,
-          { headers:{ 'Accept-Language':'en' } }
+  useEffect(()=>{
+    const h=()=>setZoom(map.getZoom())
+    map.on('zoomend',h)
+    return()=>map.off('zoomend',h)
+  },[map])
+
+  // Radius in pixels sized so adjacent circles overlap slightly → no gaps
+  // Formula tuned per source: MODIS ~1km → needs bigger radius at low zoom
+  const radius=useMemo(()=>{
+    // At zoom 9 MODIS pixels are ~8px apart; we want radius ≥ half that + 1px overlap
+    const base=Math.max(3, zoom * 0.85)
+    return Math.round(base)
+  },[zoom])
+
+  if(!pixels.length) return null
+
+  return(
+    <>
+      {pixels.map((p,i)=>{
+        const isHot=showHotspots&&thresh!=null&&p.value>=thresh
+        return(
+          <CircleMarker
+            key={i}
+            center={[p.lat,p.lon]}
+            radius={isHot?radius+2:radius}
+            pathOptions={{
+              fillColor:lstToColor(p.value,vmin,vmax),
+              fillOpacity:opacity,
+              color:isHot?'rgba(255,255,255,0.9)':'transparent',
+              weight:isHot?1.5:0,
+            }}
+            eventHandlers={onPixelClick?{click:()=>onPixelClick(p)}:{}}
+          />
         )
-        const data = await r.json()
-        setSugg(data.filter(d => d.geojson && ['Polygon','MultiPolygon'].includes(d.geojson.type)))
-      } catch {}
-      finally { setSearch(false) }
-    }, 400)
-  }, [])
+      })}
+    </>
+  )
+}
 
-  useEffect(() => { search(query) }, [query])
-
-  function select(item) {
-    const bbox = item.boundingbox
-    const latSpan = parseFloat(bbox[1])-parseFloat(bbox[0])
-    const lonSpan = parseFloat(bbox[3])-parseFloat(bbox[2])
-    const center  = [parseFloat(item.lat), parseFloat(item.lon)]
-    const zoom    = latSpan>1?9:latSpan>0.3?11:12
-    const radius  = Math.max(Math.max(latSpan,lonSpan)/2*1.2, 0.5)
-    const name    = item.display_name.split(',')[0]
-    setQuery(name); setSugg([])
-    onCitySelected({ name, center, zoom, boundary:item.geojson, radius, color })
+// ── Time series sparkline modal ───────────────────────────────────────────────
+// Fetches 12 monthly LST values for a clicked pixel from the backend
+async function fetchTimeSeries(lat, lon, source) {
+  const months = []
+  const year = new Date().getFullYear() - 1  // use previous full year
+  for (let m = 1; m <= 12; m++) {
+    const d = `${year}-${String(m).padStart(2,'0')}-15`
+    try {
+      const res = await fetch(
+        `${API}/heatmap/global?lat=${lat}&lon=${lon}&name=pixel&radius=0.05&source=${source}&date_start=${d}&date_end=${d}`
+      )
+      const data = await res.json()
+      months.push({ month: m, year, value: data.value_mean || null })
+    } catch {
+      months.push({ month: m, year, value: null })
+    }
   }
+  return months
+}
+
+const MONTH_LABELS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+const SEASON_COLORS = {
+  winter: '#38bdf8', 'pre-monsoon': '#f97316', monsoon: '#22c55e', 'post-monsoon': '#eab308'
+}
+function getSeasonColor(m) {
+  if (m<=2||m===12) return '#38bdf8'
+  if (m<=5) return '#f97316'
+  if (m<=9) return '#22c55e'
+  return '#eab308'
+}
+
+function TimeSeriesModal({ pixel, source, onClose }) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    setLoading(true); setError(''); setData(null)
+    fetchTimeSeries(pixel.lat, pixel.lon, source)
+      .then(d => { setData(d); setLoading(false) })
+      .catch(e => { setError('Failed to fetch time series'); setLoading(false) })
+  }, [pixel.lat, pixel.lon, source])
+
+  const valid = data ? data.filter(d => d.value !== null) : []
+  const minV = valid.length ? Math.min(...valid.map(d => d.value)) : 0
+  const maxV = valid.length ? Math.max(...valid.map(d => d.value)) : 50
+  const range = maxV - minV || 1
+
+  // SVG sparkline dimensions
+  const W = 480, H = 120, PAD = 16
+  const pts = data ? data.map((d, i) => {
+    const x = PAD + (i / 11) * (W - PAD * 2)
+    const y = d.value !== null ? H - PAD - ((d.value - minV) / range) * (H - PAD * 2) : null
+    return { x, y, ...d }
+  }) : []
+
+  const pathD = pts.filter(p => p.y !== null)
+    .map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')
 
   return (
-    <div style={{ position:'relative' }}>
-      <div style={{ position:'relative', display:'flex', alignItems:'center', gap:6 }}>
-        <div style={{ width:8, height:8, borderRadius:'50%', background:color, flexShrink:0 }} />
-        <div style={{ position:'relative', flex:1 }}>
-          <input value={query} onChange={e=>setQuery(e.target.value)}
-            placeholder="Search city…"
-            style={{
-              width:'100%', boxSizing:'border-box',
-              background:'var(--bg-deep)', color:'var(--text-pri)',
-              border:`1px solid ${color}55`, borderRadius:8,
-              padding:'7px 10px', fontSize:12, outline:'none',
-            }} />
-          {searching && <div style={{ position:'absolute',right:8,top:'50%',transform:'translateY(-50%)',color:'var(--text-sec)',fontSize:10 }}>…</div>}
-          {suggestions.length>0 && (
-            <div style={{
-              position:'absolute',top:'100%',left:0,right:0,zIndex:3000,
-              background:'var(--bg-card)',border:'1px solid var(--border)',
-              borderRadius:8,marginTop:4,boxShadow:'0 8px 24px rgba(0,0,0,0.5)',overflow:'hidden',
-            }}>
-              {suggestions.map((s,i) => (
-                <div key={i} onClick={()=>select(s)}
-                  style={{ padding:'8px 12px',cursor:'pointer',fontSize:12,
-                    borderBottom:i<suggestions.length-1?'1px solid var(--border)':'none',
-                    color:'var(--text-pri)' }}
-                  onMouseEnter={e=>e.currentTarget.style.background='var(--bg-deep)'}
-                  onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-                  <div style={{ fontWeight:500 }}>{s.display_name.split(',').slice(0,2).join(',')}</div>
-                  <div style={{ fontSize:10,color:'var(--text-sec)',marginTop:2 }}>{s.display_name.split(',').slice(2,4).join(',').trim()}</div>
+    <div onClick={onClose} style={{
+      position: 'fixed', inset: 0, zIndex: 9000,
+      background: 'rgba(0,0,0,0.7)', display: 'flex',
+      alignItems: 'center', justifyContent: 'center',
+      backdropFilter: 'blur(4px)',
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: '#0f172a', border: '1px solid #1e293b',
+        borderRadius: 14, padding: 24, width: 540, maxWidth: '95vw',
+        boxShadow: '0 24px 64px rgba(0,0,0,0.8)',
+      }}>
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0' }}>
+              📈 LST Time Series
+            </div>
+            <div style={{ fontSize: 10, color: '#475569', marginTop: 3, fontFamily: 'monospace' }}>
+              {pixel.lat.toFixed(4)}°N {pixel.lon.toFixed(4)}°E · {source.toUpperCase()} · {new Date().getFullYear() - 1}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer',
+            color: '#475569', fontSize: 20, lineHeight: 1, padding: 4 }}>×</button>
+        </div>
+
+        {loading && (
+          <div style={{ textAlign: 'center', padding: '40px 0', color: '#6366f1' }}>
+            <div style={{ marginBottom: 8 }}>⏳ Fetching 12 months of satellite data…</div>
+            <div style={{ fontSize: 11, color: '#334155' }}>This may take 15–30 seconds</div>
+          </div>
+        )}
+
+        {error && <div style={{ color: '#f87171', padding: 16, textAlign: 'center' }}>{error}</div>}
+
+        {data && !loading && (
+          <>
+            {/* Sparkline */}
+            <div style={{ background: '#0a0e1a', borderRadius: 10, padding: 12, marginBottom: 12, position: 'relative' }}>
+              <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ overflow: 'visible' }}>
+                {/* Grid lines */}
+                {[0, 0.25, 0.5, 0.75, 1].map(t => {
+                  const y = PAD + (1-t) * (H - PAD * 2)
+                  const v = minV + t * range
+                  return (
+                    <g key={t}>
+                      <line x1={PAD} y1={y} x2={W - PAD} y2={y} stroke="#1e293b" strokeWidth={1}/>
+                      <text x={PAD - 4} y={y + 4} fill="#334155" fontSize={9} textAnchor="end">{v.toFixed(0)}°</text>
+                    </g>
+                  )
+                })}
+
+                {/* Season backgrounds */}
+                {[{s:0,e:1,c:'#38bdf8'},{s:2,e:4,c:'#f97316'},{s:5,e:8,c:'#22c55e'},{s:9,e:10,c:'#eab308'},{s:11,e:11,c:'#38bdf8'}].map(({s,e,c},i) => {
+                  const x1 = PAD + (s/11)*(W-PAD*2) - (s>0?0:0)
+                  const x2 = PAD + (e/11)*(W-PAD*2) + (e<11?(W-PAD*2)/11:0)
+                  return <rect key={i} x={x1} y={PAD} width={x2-x1} height={H-PAD*2} fill={c} fillOpacity={0.05}/>
+                })}
+
+                {/* Area fill under line */}
+                {pathD && (
+                  <path d={`${pathD} L${pts.filter(p=>p.y!==null).slice(-1)[0]?.x},${H-PAD} L${pts.filter(p=>p.y!==null)[0]?.x},${H-PAD} Z`}
+                    fill="url(#sparkGrad)" fillOpacity={0.3}/>
+                )}
+
+                {/* Line */}
+                {pathD && <path d={pathD} fill="none" stroke="#f97316" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"/>}
+
+                {/* Points */}
+                {pts.map((pt, i) => pt.y !== null && (
+                  <g key={i}>
+                    <circle cx={pt.x} cy={pt.y} r={4} fill={getSeasonColor(pt.month)} stroke="#0a0e1a" strokeWidth={1.5}/>
+                    <text x={pt.x} y={H - 2} fill="#334155" fontSize={8} textAnchor="middle">{MONTH_LABELS[i]}</text>
+                    {/* value label on hover — simplified: show on top for peaks */}
+                    {(pt.value === maxV || pt.value === minV) && (
+                      <text x={pt.x} y={pt.y - 8} fill="#fb923c" fontSize={9} textAnchor="middle" fontWeight="700">
+                        {pt.value.toFixed(1)}°
+                      </text>
+                    )}
+                  </g>
+                ))}
+
+                <defs>
+                  <linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#f97316" stopOpacity={0.6}/>
+                    <stop offset="100%" stopColor="#f97316" stopOpacity={0}/>
+                  </linearGradient>
+                </defs>
+              </svg>
+            </div>
+
+            {/* Monthly grid */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6,1fr)', gap: 4 }}>
+              {data.map((d, i) => (
+                <div key={i} style={{
+                  textAlign: 'center', padding: '5px 2px', borderRadius: 6,
+                  background: d.value ? `${lstToColor(d.value, minV, maxV)}22` : '#0a0e1a',
+                  border: `1px solid ${d.value ? lstToColor(d.value, minV, maxV)+'44' : '#1e293b'}`,
+                }}>
+                  <div style={{ fontSize: 9, color: '#475569', marginBottom: 2 }}>{MONTH_LABELS[i]}</div>
+                  <div style={{ fontSize: 12, fontWeight: 700, fontFamily: 'monospace',
+                    color: d.value ? lstToColor(d.value, minV, maxV) : '#334155' }}>
+                    {d.value ? d.value.toFixed(1)+'°' : '—'}
+                  </div>
                 </div>
               ))}
             </div>
-          )}
-        </div>
+
+            {/* Stats row */}
+            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+              {[
+                ['Peak',`${maxV.toFixed(1)}°C`,`(${MONTH_LABELS[data.findIndex(d=>d.value===maxV)]})`, '#f87171'],
+                ['Minimum',`${minV.toFixed(1)}°C`,`(${MONTH_LABELS[data.findIndex(d=>d.value===minV)]})`, '#38bdf8'],
+                ['Annual Swing',`${(maxV-minV).toFixed(1)}°C`,'seasonal range','#a78bfa'],
+                ['Annual Mean',`${valid.length?(valid.reduce((s,d)=>s+d.value,0)/valid.length).toFixed(1):'—'}°C`,'avg LST','#fb923c'],
+              ].map(([l,v,sub,col])=>(
+                <div key={l} style={{flex:1,padding:'8px 10px',borderRadius:8,background:'#0a0e1a',border:'1px solid #1e293b',textAlign:'center'}}>
+                  <div style={{fontSize:9,color:'#475569',marginBottom:4}}>{l}</div>
+                  <div style={{fontSize:14,fontWeight:700,color:col,fontFamily:'monospace'}}>{v}</div>
+                  <div style={{fontSize:9,color:'#334155',marginTop:2}}>{sub}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{marginTop:10,fontSize:9,color:'#334155',textAlign:'center'}}>
+              Click outside to close · Data from NASA Earth Engine {source.toUpperCase()}
+            </div>
+          </>
+        )}
       </div>
     </div>
   )
 }
 
-// ─── SwipeMap (fixed) ─────────────────────────────────────────────────────────
+// ─── CitySearchSlot ───────────────────────────────────────────────────────────
+function CitySearchSlot({slotId,color,onSelect,onRemove,canRemove}){
+  const [q,setQ]=useState('')
+  const [sugg,setSugg]=useState([])
+  const [busy,setBusy]=useState(false)
+  const timer=useRef(null)
+  useEffect(()=>{
+    if(!q||q.length<2){setSugg([]);return}
+    clearTimeout(timer.current)
+    timer.current=setTimeout(async()=>{
+      setBusy(true)
+      try{
+        const r=await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&polygon_geojson=1&limit=5&featuretype=city`,{headers:{'Accept-Language':'en'}})
+        const d=await r.json()
+        setSugg(d.filter(x=>x.geojson&&['Polygon','MultiPolygon'].includes(x.geojson.type)))
+      }catch{}finally{setBusy(false)}
+    },400)
+  },[q])
+  function pick(item){
+    const bb=item.boundingbox
+    const latS=parseFloat(bb[1])-parseFloat(bb[0]),lonS=parseFloat(bb[3])-parseFloat(bb[2])
+    setQ(item.display_name.split(',')[0]);setSugg([])
+    onSelect({slotId,color,name:item.display_name.split(',')[0],
+      center:[parseFloat(item.lat),parseFloat(item.lon)],
+      zoom:latS>1?9:latS>0.3?11:12,
+      radius:Math.max(Math.max(latS,lonS)/2*1.2,0.5),
+      boundary:item.geojson})
+  }
+  return(
+    <div style={{display:'flex',alignItems:'center',gap:6,position:'relative'}}>
+      <div style={{width:8,height:8,borderRadius:'50%',background:color,flexShrink:0}}/>
+      <div style={{flex:1,position:'relative'}}>
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search city or region…"
+          style={{width:'100%',boxSizing:'border-box',padding:'7px 10px',fontSize:12,
+            background:'var(--bg-deep)',color:'var(--text-pri)',border:`1px solid ${color}55`,
+            borderRadius:8,outline:'none',transition:'border-color 0.15s'}}
+          onFocus={e=>e.target.style.borderColor=color}
+          onBlur={e=>e.target.style.borderColor=`${color}55`}/>
+        {busy&&<span style={{position:'absolute',right:8,top:'50%',transform:'translateY(-50%)',color:'var(--text-sec)',fontSize:10}}>…</span>}
+        {sugg.length>0&&(
+          <div style={{position:'absolute',top:'100%',left:0,right:0,zIndex:3000,marginTop:4,
+            background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:8,
+            boxShadow:'0 8px 32px rgba(0,0,0,0.6)',overflow:'hidden'}}>
+            {sugg.map((s,i)=>(
+              <div key={i} onClick={()=>pick(s)}
+                style={{padding:'8px 12px',cursor:'pointer',fontSize:12,
+                  borderBottom:i<sugg.length-1?'1px solid var(--border)':'none',color:'var(--text-pri)'}}
+                onMouseEnter={e=>e.currentTarget.style.background='var(--bg-deep)'}
+                onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                <div style={{fontWeight:500}}>{s.display_name.split(',').slice(0,2).join(',')}</div>
+                <div style={{fontSize:10,color:'var(--text-sec)',marginTop:2}}>{s.display_name.split(',').slice(2,4).join(',').trim()}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {canRemove&&<button onClick={onRemove} style={{background:'none',border:'none',cursor:'pointer',color:'#475569',fontSize:18,lineHeight:1,padding:'0 2px',flexShrink:0,transition:'color 0.1s'}} onMouseEnter={e=>e.target.style.color='#f87171'} onMouseLeave={e=>e.target.style.color='#475569'}>×</button>}
+    </div>
+  )
+}
 
-function SwipeMap({ cityA, pixelsA, colorA, cityB, pixelsB, colorB, vmin, vmax, flyTarget }) {
-  const [dividerPct, setDividerPct] = useState(50)
-  const containerRef = useRef(null)
-  const isDragging   = useRef(false)
-  const mapARef      = useRef(null)
-  const mapBRef      = useRef(null)
+// ─── SwipeMap ─────────────────────────────────────────────────────────────────
+function SwipeMap({cityList,cityPixelsA,cityPixelsB,cmpExcluded,vmin,vmax,flyTarget,srcColor,cmpColor,tileMode,date,cmpDate,showHotspots,threshMap,onPixelClick}){
+  const [pct,setPct]=useState(50)
+  const ref=useRef(null);const drag=useRef(false)
+  const mapARef=useRef(null);const mapBRef=useRef(null)
+  const [hoverLL,setHoverLL]=useState([null,null])
+  useEffect(()=>{
+    const mv=e=>{if(!drag.current||!ref.current)return;const r=ref.current.getBoundingClientRect();const x=(e.touches?e.touches[0].clientX:e.clientX)-r.left;setPct(Math.max(5,Math.min(95,(x/r.width)*100)))}
+    const up=()=>{drag.current=false}
+    window.addEventListener('mousemove',mv);window.addEventListener('mouseup',up)
+    window.addEventListener('touchmove',mv);window.addEventListener('touchend',up)
+    return()=>{window.removeEventListener('mousemove',mv);window.removeEventListener('mouseup',up);window.removeEventListener('touchmove',mv);window.removeEventListener('touchend',up)}
+  },[])
+  const center=cityList[0]?.center||[22.55,88.37];const zoom=cityList[0]?.zoom||9
+  const activeCities=cityList.filter(c=>!cmpExcluded.has(c.slotId))
+  return(
+    <div ref={ref} style={{position:'relative',height:'100%',overflow:'hidden',userSelect:'none'}}>
+      <div style={{position:'absolute',inset:0,clipPath:`inset(0 ${100-pct}% 0 0)`}}>
+        <MapContainer center={center} zoom={zoom} style={{height:'100%',width:'100%',background:'#0a0e1a'}} whenCreated={m=>{mapARef.current=m}}>
+          <BaseTileLayer tileMode={tileMode} date={date}/>
+          {flyTarget&&<MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom}/>}
+          <MapSync sourceRef={mapARef} targetRef={mapBRef}/>
+          <MapHoverEmitter onHover={(la,lo)=>setHoverLL([la,lo])}/>
+          {cityList.map(c=>c.boundary&&<GeoJSON key={c.slotId} data={c.boundary} style={{color:c.color,weight:2,fillOpacity:0}}/>)}
+          {cityList.map(c=><PixelLayer key={c.slotId} pixels={cityPixelsA[c.slotId]||[]} vmin={vmin} vmax={vmax} thresh={threshMap[c.slotId]} showHotspots={showHotspots} onPixelClick={onPixelClick}/>)}
+          <SyncedHoverLayer hoverLatLon={hoverLL} pixels={cityPixelsA} cityList={cityList} label="A" color={srcColor}/>
+        </MapContainer>
+      </div>
+      <div style={{position:'absolute',inset:0,clipPath:`inset(0 0 0 ${pct}%)`}}>
+        <MapContainer center={center} zoom={zoom} style={{height:'100%',width:'100%',background:'#0a0e1a'}} whenCreated={m=>{mapBRef.current=m}}>
+          <BaseTileLayer tileMode={tileMode} date={cmpDate||date}/>
+          {flyTarget&&<MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom}/>}
+          <MapSync sourceRef={mapBRef} targetRef={mapARef}/>
+          {activeCities.map(c=>c.boundary&&<GeoJSON key={c.slotId} data={c.boundary} style={{color:c.color,weight:2,fillOpacity:0}}/>)}
+          {activeCities.map(c=><PixelLayer key={c.slotId} pixels={cityPixelsB[c.slotId]||[]} vmin={vmin} vmax={vmax} thresh={threshMap[c.slotId]} showHotspots={showHotspots}/>)}
+          <SyncedHoverLayer hoverLatLon={hoverLL} pixels={cityPixelsB} cityList={activeCities} label="B" color={cmpColor}/>
+        </MapContainer>
+      </div>
+      <div onMouseDown={()=>drag.current=true} onTouchStart={()=>drag.current=true}
+        style={{position:'absolute',top:0,bottom:0,left:`calc(${pct}% - 1px)`,width:3,
+          background:'rgba(255,255,255,0.9)',cursor:'ew-resize',zIndex:2000,
+          display:'flex',alignItems:'center',justifyContent:'center'}}>
+        <div style={{width:34,height:34,borderRadius:'50%',background:'white',display:'flex',
+          alignItems:'center',justifyContent:'center',fontSize:14,color:'#0a0e1a',fontWeight:800,
+          boxShadow:'0 2px 12px rgba(0,0,0,0.6)'}}>↔</div>
+      </div>
+      <div style={{position:'absolute',top:10,left:10,zIndex:1500,background:'rgba(10,14,26,0.88)',border:`1px solid ${srcColor}`,borderRadius:8,padding:'4px 12px',fontSize:10,fontWeight:700,color:srcColor}}>A · {date}</div>
+      <div style={{position:'absolute',top:10,right:10,zIndex:1500,background:'rgba(10,14,26,0.88)',border:`1px solid ${cmpColor}`,borderRadius:8,padding:'4px 12px',fontSize:10,fontWeight:700,color:cmpColor}}>B · {cmpDate}</div>
+    </div>
+  )
+}
 
-  // sync map views
-  function syncMaps(sourceMap, targetMap) {
-    if (!sourceMap || !targetMap) return
-    sourceMap.on('move', () => {
-      targetMap.setView(sourceMap.getCenter(), sourceMap.getZoom(), { animate:false })
+// ─── Main ─────────────────────────────────────────────────────────────────────
+export default function Heatmap(){
+  const [slots,setSlots]             =useState([{id:1}])
+  const [cities,setCities]           =useState({})
+  const [cityPixels,setCityPixels]   =useState({})
+  const [cityRaw,setCityRaw]         =useState({})
+  const [loadingA,setLoadingA]       =useState({})
+  const [errorA,setErrorA]           =useState({})
+  const nextId                       =useRef(2)
+
+  const [source,setSource]     =useState('modis')
+  const [date,setDate]         =useState(todayMinus3)
+  const [clipBdy,setClipBdy]   =useState(true)
+  const [flyTarget,setFlyTarget]=useState(null)
+  const [tileMode,setTileMode] =useState('dark')
+  const [showHotspots,setShowHotspots]=useState(false)
+  const [showNarrative,setShowNarrative]=useState(true)
+
+  const [compare,setCompare]       =useState(false)
+  const [cmpMode,setCmpMode]       =useState('sidebyside')
+  const [cmpSrc,setCmpSrc]         =useState('modis')
+  const [cmpDate,setCmpDate]       =useState('')
+  const [cmpRawMap,setCmpRawMap]   =useState({})
+  const [cmpPxMap,setCmpPxMap]     =useState({})
+  const [loadingB,setLoadingB]     =useState({})
+  const [errorB,setErrorB]         =useState({})
+  const [cmpExcluded,setCmpExcluded]=useState(new Set())
+  const [fadeOp,setFadeOp]         =useState(50)
+  const [hoverLL,setHoverLL]       =useState([null,null])
+  const [selectedPixel,setSelectedPixel]=useState(null)  // for time series modal
+
+  const mapARef=useRef(null);const mapBRef=useRef(null)
+
+  const srcObj   =SOURCES.find(s=>s.id===source)
+  const cmpSrcObj=SOURCES.find(s=>s.id===cmpSrc)
+  const MAX_DATE =todayMinus3()
+  const cityList =Object.values(cities)
+  const mapCenter=cityList[0]?.center||[22.55,88.37]
+  const mapZoom  =cityList[0]?.zoom||5
+
+  // per-city 90th percentile thresholds for hotspot detection
+  const threshMap=useMemo(()=>{
+    const m={}
+    cityList.forEach(c=>{m[c.slotId]=p90(cityPixels[c.slotId])})
+    return m
+  },[cityPixels,cityList.map(c=>c.slotId).join()])
+
+  function clipPx(data,cityData,doClip){
+    if(!data?.pixels)return[]
+    const ring=cityData?.boundary?outerRing(cityData.boundary):null
+    return doClip&&ring?data.pixels.filter(p=>p.value!==null&&pip(p.lat,p.lon,ring)):data.pixels.filter(p=>p.value!==null)
+  }
+
+  async function fetchA(slotId,c,src,d){
+    if(!c)return
+    setLoadingA(l=>({...l,[slotId]:true}));setErrorA(e=>({...e,[slotId]:''}))
+    try{
+      const res=await fetch(`${API}/heatmap/global?lat=${c.center[0]}&lon=${c.center[1]}&name=${encodeURIComponent(c.name)}&radius=${c.radius}&source=${src}&date_start=${d}&date_end=${d}`)
+      const data=await res.json()
+      if(data.detail){setErrorA(e=>({...e,[slotId]:data.detail}));return}
+      setCityRaw(r=>({...r,[slotId]:data}));setCityPixels(p=>({...p,[slotId]:clipPx(data,c,clipBdy)}))
+    }catch{setErrorA(e=>({...e,[slotId]:'Network error'}))}
+    finally{setLoadingA(l=>({...l,[slotId]:false}))}
+  }
+  async function fetchB(slotId,c,src,d){
+    if(!c||!d)return
+    setLoadingB(l=>({...l,[slotId]:true}));setErrorB(e=>({...e,[slotId]:''}))
+    try{
+      const res=await fetch(`${API}/heatmap/global?lat=${c.center[0]}&lon=${c.center[1]}&name=${encodeURIComponent(c.name)}&radius=${c.radius}&source=${src}&date_start=${d}&date_end=${d}`)
+      const data=await res.json()
+      if(data.detail){setErrorB(e=>({...e,[slotId]:data.detail}));return}
+      setCmpRawMap(r=>({...r,[slotId]:data}));setCmpPxMap(p=>({...p,[slotId]:clipPx(data,c,clipBdy)}))
+    }catch{setErrorB(e=>({...e,[slotId]:'Network error'}))}
+    finally{setLoadingB(l=>({...l,[slotId]:false}))}
+  }
+  function fetchAllB(src,d){cityList.forEach(c=>{if(!cmpExcluded.has(c.slotId))fetchB(c.slotId,c,src,d)})}
+
+  useEffect(()=>{
+    cityList.forEach(c=>{
+      if(cityRaw[c.slotId])setCityPixels(p=>({...p,[c.slotId]:clipPx(cityRaw[c.slotId],c,clipBdy)}))
+      if(cmpRawMap[c.slotId])setCmpPxMap(p=>({...p,[c.slotId]:clipPx(cmpRawMap[c.slotId],c,clipBdy)}))
+    })
+  },[clipBdy])
+  useEffect(()=>{cityList.forEach(c=>fetchA(c.slotId,c,source,date))},[source,date])
+  useEffect(()=>{if(compare&&cmpDate)fetchAllB(cmpSrc,cmpDate)},[cmpSrc,cmpDate])
+  useEffect(()=>{
+    if(compare&&!cmpDate){
+      const d=new Date(date);d.setDate(d.getDate()-30)
+      const s=d.toISOString().split('T')[0]
+      setCmpDate(s<(cmpSrcObj?.min||'2000-02-24')?cmpSrcObj?.min:s)
+    }
+  },[compare])
+  useEffect(()=>{if(cmpMode!=='sidebyside'){mapARef.current=null;mapBRef.current=null}},[cmpMode])
+
+  function addSlot(){if(slots.length>=6)return;setSlots(s=>[...s,{id:nextId.current++}])}
+  function removeSlot(id){
+    setSlots(s=>s.filter(sl=>sl.id!==id))
+    ;[setCities,setCityPixels,setCityRaw,setCmpRawMap,setCmpPxMap,setLoadingA,setLoadingB,setErrorA,setErrorB]
+      .forEach(fn=>fn(o=>{const n={...o};delete n[id];return n}))
+    setCmpExcluded(ex=>{const n=new Set(ex);n.delete(id);return n})
+  }
+  function toggleExclude(slotId){
+    setCmpExcluded(ex=>{
+      const n=new Set(ex)
+      if(n.has(slotId)){n.delete(slotId);const c=cities[slotId];if(c&&cmpDate)fetchB(slotId,c,cmpSrc,cmpDate)}
+      else n.add(slotId)
+      return n
     })
   }
-
-  function onMouseDown(e) { e.preventDefault(); isDragging.current = true }
-
-  useEffect(() => {
-    function onMove(e) {
-      if (!isDragging.current || !containerRef.current) return
-      const rect = containerRef.current.getBoundingClientRect()
-      const clientX = e.touches ? e.touches[0].clientX : e.clientX
-      const pct = ((clientX - rect.left) / rect.width) * 100
-      setDividerPct(Math.max(5, Math.min(95, pct)))
-    }
-    function onUp() { isDragging.current = false }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
-    window.addEventListener('touchmove', onMove)
-    window.addEventListener('touchend', onUp)
-    return () => {
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
-      window.removeEventListener('touchmove', onMove)
-      window.removeEventListener('touchend', onUp)
-    }
-  }, [])
-
-  const center = cityA?.center || [22.55, 88.37]
-  const zoom   = cityA?.zoom   || 9
-
-  return (
-    <div ref={containerRef} style={{ position:'relative', height:'100%', overflow:'hidden', userSelect:'none' }}>
-      {/* Map A — full width, clipped to left of divider */}
-      <div style={{ position:'absolute', inset:0, clipPath:`inset(0 ${100-dividerPct}% 0 0)` }}>
-        <MapContainer center={center} zoom={zoom} style={{ height:'100%', width:'100%', background:'#0a0e1a' }}
-          whenCreated={map => { mapARef.current = map }}>
-          <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" attribution='&copy; CARTO' />
-          {flyTarget && <MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom} />}
-          {cityA?.boundary && <GeoJSON data={cityA.boundary} style={{ color:colorA, weight:2, fillOpacity:0 }} />}
-          {(pixelsA||[]).map((p,i) => (
-            <CircleMarker key={i} center={[p.lat,p.lon]} radius={6}
-              pathOptions={{ fillColor:lstToColor(p.value,vmin,vmax), fillOpacity:0.88, color:'transparent', weight:0 }}>
-              <Tooltip><div style={{ fontFamily:'monospace',fontSize:11 }}><b style={{color:colorA}}>{cityA?.name}</b><br/>{p.lat.toFixed(4)}°N {p.lon.toFixed(4)}°E<br/><b>LST:</b> {p.value.toFixed(1)}°C</div></Tooltip>
-            </CircleMarker>
-          ))}
-        </MapContainer>
-      </div>
-
-      {/* Map B — full width, clipped to right of divider */}
-      <div style={{ position:'absolute', inset:0, clipPath:`inset(0 0 0 ${dividerPct}%)` }}>
-        <MapContainer center={center} zoom={zoom} style={{ height:'100%', width:'100%', background:'#0a0e1a' }}
-          whenCreated={map => { mapBRef.current = map }}>
-          <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" attribution='&copy; CARTO' />
-          {flyTarget && <MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom} />}
-          {cityB?.boundary && <GeoJSON data={cityB.boundary} style={{ color:colorB, weight:2, fillOpacity:0 }} />}
-          {(pixelsB||[]).map((p,i) => (
-            <CircleMarker key={i} center={[p.lat,p.lon]} radius={6}
-              pathOptions={{ fillColor:lstToColor(p.value,vmin,vmax), fillOpacity:0.88, color:'transparent', weight:0 }}>
-              <Tooltip><div style={{ fontFamily:'monospace',fontSize:11 }}><b style={{color:colorB}}>{cityB?.name}</b><br/>{p.lat.toFixed(4)}°N {p.lon.toFixed(4)}°E<br/><b>LST:</b> {p.value.toFixed(1)}°C</div></Tooltip>
-            </CircleMarker>
-          ))}
-        </MapContainer>
-      </div>
-
-      {/* Divider line */}
-      <div
-        onMouseDown={onMouseDown} onTouchStart={onMouseDown}
-        style={{
-          position:'absolute', top:0, bottom:0,
-          left:`calc(${dividerPct}% - 1px)`,
-          width:3, background:'white', cursor:'ew-resize', zIndex:2000,
-          display:'flex', alignItems:'center', justifyContent:'center',
-        }}>
-        <div style={{
-          width:32, height:32, borderRadius:'50%', background:'white',
-          display:'flex', alignItems:'center', justifyContent:'center',
-          fontSize:14, color:'#0a0e1a', fontWeight:800,
-          boxShadow:'0 2px 12px rgba(0,0,0,0.6)',
-        }}>↔</div>
-      </div>
-
-      {/* Labels */}
-      <div style={{ position:'absolute',top:10,left:10,zIndex:1500,
-        background:'rgba(10,14,26,0.85)',border:`1px solid ${colorA}`,
-        borderRadius:8,padding:'5px 12px',fontSize:11,fontWeight:700,color:colorA }}>
-        A
-      </div>
-      <div style={{ position:'absolute',top:10,right:10,zIndex:1500,
-        background:'rgba(10,14,26,0.85)',border:`1px solid ${colorB}`,
-        borderRadius:8,padding:'5px 12px',fontSize:11,fontWeight:700,color:colorB }}>
-        B
-      </div>
-    </div>
-  )
-}
-
-// ─── Main Heatmap ─────────────────────────────────────────────────────────────
-
-export default function Heatmap() {
-  // Primary
-  const [city, setCity]             = useState(null)
-  const [source, setSource]         = useState('modis')
-  const [date, setDate]             = useState(maxDate)
-  const [rawData, setRawData]       = useState(null)
-  const [pixels, setPixels]         = useState([])
-  const [loading, setLoading]       = useState(false)
-  const [error, setError]           = useState('')
-  const [clipBdy, setClipBdy]       = useState(true)
-  const [flyTarget, setFlyTarget]   = useState(null)
-
-  // Compare
-  const [compare, setCompare]       = useState(false)
-  const [cmpMode, setCmpMode]       = useState('sidebyside')  // sidebyside | fade | swipe
-  const [cmpDate, setCmpDate]       = useState('')
-  const [cmpSrc, setCmpSrc]         = useState('modis')
-  const [cmpRaw, setCmpRaw]         = useState(null)
-  const [cmpPixels, setCmpPixels]   = useState([])
-  const [cmpLoading, setCmpLoading] = useState(false)
-  const [cmpError, setCmpError]     = useState('')
-  const [fadeOpacity, setFadeOp]    = useState(50)
-
-  const srcObj    = SOURCES.find(s => s.id === source)
-  const cmpSrcObj = SOURCES.find(s => s.id === cmpSrc)
-  const MAX_DATE  = maxDate()
-
-  // ── data fetching ───────────────────────────────────────────────────────────
-
-  function clip(data, c, doClip, setter) {
-    if (!data) return
-    const ring = c?.boundary ? getOuterRing(c.boundary) : null
-    setter(
-      (doClip && ring
-        ? data.pixels.filter(p => p.value !== null && pointInPolygon(p.lat, p.lon, ring))
-        : data.pixels.filter(p => p.value !== null))
-    )
+  function onCitySelected(cityData){
+    setCities(c=>({...c,[cityData.slotId]:cityData}))
+    setFlyTarget({center:cityData.center,zoom:cityData.zoom})
+    fetchA(cityData.slotId,cityData,source,date)
+    if(compare&&cmpDate&&!cmpExcluded.has(cityData.slotId))fetchB(cityData.slotId,cityData,cmpSrc,cmpDate)
   }
 
-  async function fetchPrimary(c, s, d) {
-    if (!c) return
-    setLoading(true); setError(''); setRawData(null); setPixels([])
-    try {
-      const r = await fetch(`${API_BASE}/heatmap/global?lat=${c.center[0]}&lon=${c.center[1]}&name=${encodeURIComponent(c.name)}&radius=${c.radius}&source=${s}&date_start=${d}&date_end=${d}`)
-      const data = await r.json()
-      if (data.detail) { setError(data.detail); return }
-      setRawData(data); clip(data, c, clipBdy, setPixels)
-    } catch { setError('Network error') }
-    finally { setLoading(false) }
-  }
+  const activeCmpCities=cityList.filter(c=>!cmpExcluded.has(c.slotId))
+  const allVals=[
+    ...cityList.flatMap(c=>(cityRaw[c.slotId]?.pixels||[]).map(p=>p.value)),
+    ...activeCmpCities.flatMap(c=>(cmpRawMap[c.slotId]?.pixels||[]).map(p=>p.value)),
+  ]
+  const vmin=allVals.length?Math.min(...allVals):20
+  const vmax=allVals.length?Math.max(...allVals):50
+  const anyLoadingA=Object.values(loadingA).some(Boolean)
+  const anyLoadingB=Object.values(loadingB).some(Boolean)
+  const hasData=cityList.some(c=>cityRaw[c.slotId])
 
-  async function fetchCompare(c, s, d) {
-    if (!c || !d) return
-    setCmpLoading(true); setCmpError(''); setCmpRaw(null); setCmpPixels([])
-    try {
-      const r = await fetch(`${API_BASE}/heatmap/global?lat=${c.center[0]}&lon=${c.center[1]}&name=${encodeURIComponent(c.name)}&radius=${c.radius}&source=${s}&date_start=${d}&date_end=${d}`)
-      const data = await r.json()
-      if (data.detail) { setCmpError(data.detail); return }
-      setCmpRaw(data); clip(data, c, clipBdy, setCmpPixels)
-    } catch { setCmpError('Network error') }
-    finally { setCmpLoading(false) }
-  }
+  // Color scale ticks
+  const ticks=4
+  const tickVals=Array.from({length:ticks+1},(_,i)=>vmin+(vmax-vmin)*(i/ticks))
+  const tickLabels=['Cool','Moderate','Warm','Hot','Extreme']
 
-  useEffect(() => { clip(rawData, city, clipBdy, setPixels); clip(cmpRaw, city, clipBdy, setCmpPixels) }, [clipBdy])
-  useEffect(() => { if (city) fetchPrimary(city, source, date) }, [source, date])
-  useEffect(() => { if (city && compare && cmpDate) fetchCompare(city, cmpSrc, cmpDate) }, [cmpSrc, cmpDate])
+  // Narrative
+  const narrative=useMemo(()=>
+    hasData?buildNarrative(cityList,cityRaw,cityPixels,compare,cmpRawMap,cmpDate,date,source):''
+  ,[cityRaw,cityPixels,cmpRawMap,compare,date,cmpDate])
 
-  useEffect(() => {
-    if (compare && !cmpDate) {
-      const d = new Date(date); d.setDate(d.getDate() - 30)
-      const s = d.toISOString().split('T')[0]
-      setCmpDate(s < (cmpSrcObj?.minDate||'2000-02-24') ? cmpSrcObj?.minDate : s)
-    }
-  }, [compare])
-
-  function onCitySelected(c) {
-    setCity(c); setFlyTarget({ center:c.center, zoom:c.zoom })
-    fetchPrimary(c, source, date)
-    if (compare && cmpDate) fetchCompare(c, cmpSrc, cmpDate)
-  }
-
-  const allValues = [...(rawData?.pixels?.map(p=>p.value)||[]), ...(cmpRaw?.pixels?.map(p=>p.value)||[])]
-  const vmin = allValues.length ? Math.min(...allValues) : 20
-  const vmax = allValues.length ? Math.max(...allValues) : 50
-  const anyLoading = loading || cmpLoading
-
-  // ── render ──────────────────────────────────────────────────────────────────
-
-  return (
-    <div style={{ display:'flex', flexDirection:'column', height:'100%' }}>
-
-      {/* page header */}
-      <div className="page-header">
-        <h2>Spatial Heatmap</h2>
-        <p>Real satellite LST · Search any city · Compare across dates or satellites</p>
+  // ── render ─────────────────────────────────────────────────────────────────
+  return(
+    <div style={{display:'flex',flexDirection:'column',height:'100%'}}>
+      <div className="page-header" style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+        <div>
+          <h2>Spatial Heatmap</h2>
+          <p>Real satellite LST · Multi-city · Compare dates · NASA daily imagery</p>
+        </div>
+        {/* Export buttons */}
+        {hasData&&(
+          <div style={{display:'flex',gap:8}}>
+            <button onClick={()=>exportCSV(cityList,cityPixels,date,source)}
+              style={{display:'flex',alignItems:'center',gap:6,padding:'7px 14px',borderRadius:8,
+                border:'1px solid #334155',background:'var(--bg-card)',color:'#94a3b8',
+                cursor:'pointer',fontSize:12,fontWeight:600}}
+              onMouseEnter={e=>e.currentTarget.style.borderColor='#6366f1'}
+              onMouseLeave={e=>e.currentTarget.style.borderColor='#334155'}>
+              ⬇ CSV
+            </button>
+            <button onClick={exportPNG}
+              style={{display:'flex',alignItems:'center',gap:6,padding:'7px 14px',borderRadius:8,
+                border:'1px solid #334155',background:'var(--bg-card)',color:'#94a3b8',
+                cursor:'pointer',fontSize:12,fontWeight:600}}
+              onMouseEnter={e=>e.currentTarget.style.borderColor='#6366f1'}
+              onMouseLeave={e=>e.currentTarget.style.borderColor='#334155'}>
+              📷 PNG
+            </button>
+          </div>
+        )}
       </div>
 
-      <div style={{ display:'flex', flex:1, gap:16, minHeight:0 }}>
+      <div style={{display:'flex',flex:1,gap:16,minHeight:0}}>
 
-        {/* ── SIDEBAR ───────────────────────────────────────────────────────── */}
-        <div style={{
-          width:240, flexShrink:0,
-          background:'var(--bg-card)', border:'1px solid var(--border)',
-          borderRadius:12, padding:16,
-          display:'flex', flexDirection:'column', gap:20,
-          overflowY:'auto',
-        }}>
+        {/* ── SIDEBAR ─────────────────────────────────────────────────────── */}
+        <div style={{width:252,flexShrink:0,background:'var(--bg-card)',border:'1px solid var(--border)',
+          borderRadius:12,padding:16,display:'flex',flexDirection:'column',gap:18,overflowY:'auto'}}>
 
           {/* Location */}
           <div>
-            <div style={{ fontSize:11, fontWeight:700, color:'var(--text-sec)',
-              textTransform:'uppercase', letterSpacing:'0.08em', marginBottom:8 }}>
-              Location
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8}}>
+              <div style={{fontSize:11,fontWeight:700,color:'var(--text-sec)',textTransform:'uppercase',letterSpacing:'0.08em'}}>Location</div>
+              {slots.length<6&&(
+                <button onClick={addSlot}
+                  style={{width:22,height:22,borderRadius:'50%',background:'#6366f115',border:'1px solid #6366f1',
+                    color:'#6366f1',fontSize:16,fontWeight:700,cursor:'pointer',display:'flex',
+                    alignItems:'center',justifyContent:'center',lineHeight:1,padding:0}}>+</button>
+              )}
             </div>
-            <CitySearchSlot color="#6366f1" onCitySelected={onCitySelected} />
-            {city && (
-              <div style={{ marginTop:8, fontSize:11, color:'var(--text-sec)' }}>
-                <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-                  <div style={{ width:6, height:6, borderRadius:'50%', background:'#6366f1' }} />
-                  <span style={{ color:'var(--text-pri)', fontWeight:600 }}>{city.name}</span>
-                </div>
-                {rawData && !loading && (
-                  <div style={{ marginTop:4, paddingLeft:12 }}>
-                    <span style={{ color:'#fb923c' }}>{rawData.value_mean.toFixed(1)}°C avg</span>
-                    {' · '}
-                    <span>{pixels.length.toLocaleString()} px</span>
-                  </div>
-                )}
-                {loading && <div style={{ paddingLeft:12, color:'#6366f1', marginTop:4 }}>Loading…</div>}
-                {error && <div style={{ paddingLeft:12, color:'#f87171', marginTop:4, fontSize:10 }}>{error}</div>}
+            <div style={{display:'flex',flexDirection:'column',gap:8}}>
+              {slots.map((slot,idx)=>(
+                <CitySearchSlot key={slot.id} slotId={slot.id} color={CITY_COLORS[idx%CITY_COLORS.length]}
+                  onSelect={onCitySelected} onRemove={()=>removeSlot(slot.id)} canRemove={slots.length>1}/>
+              ))}
+            </div>
+            {slots.length<6&&<div style={{marginTop:5,fontSize:10,color:'#475569'}}>+ up to {6-slots.length} more cities</div>}
+
+            {cityList.length>0&&(
+              <div style={{marginTop:10,display:'flex',flexDirection:'column',gap:5}}>
+                <div style={{fontSize:10,fontWeight:700,color:'var(--text-sec)',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:2}}>Active</div>
+                {cityList.map(c=>{
+                  const rd=cityRaw[c.slotId];const px=cityPixels[c.slotId]||[]
+                  const uhi=computeUHI(px);const isEx=cmpExcluded.has(c.slotId)
+                  const hotN=showHotspots?px.filter(p=>p.value>=threshMap[c.slotId]).length:null
+                  return(
+                    <div key={c.slotId} style={{display:'flex',alignItems:'flex-start',gap:8,padding:'6px 8px',borderRadius:8,background:'var(--bg-deep)'}}>
+                      <div style={{width:8,height:8,borderRadius:'50%',background:c.color,flexShrink:0,marginTop:3}}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:12,fontWeight:600,color:'var(--text-pri)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{c.name}</div>
+                        {loadingA[c.slotId]&&<div style={{fontSize:10,color:c.color}}>Fetching…</div>}
+                        {errorA[c.slotId]&&<div style={{fontSize:10,color:'#f87171'}}>{errorA[c.slotId]}</div>}
+                        {rd&&!loadingA[c.slotId]&&(
+                          <div style={{fontSize:10,color:'var(--text-sec)',marginTop:2}}>
+                            <span style={{color:'#fb923c',fontWeight:600}}>{rd.value_mean.toFixed(1)}°C</span>
+                            {' · '}{(px.length).toLocaleString()} px
+                            {uhi&&<span style={{color:'#f87171'}}> · UHI {uhi}°C</span>}
+                            {hotN>0&&<span style={{color:'#fbbf24'}}> · 🔥{hotN}</span>}
+                          </div>
+                        )}
+                        {compare&&rd&&cmpRawMap[c.slotId]&&!isEx&&(
+                          <div style={{fontSize:10,color:'#f97316',marginTop:1}}>
+                            B: {cmpRawMap[c.slotId].value_mean.toFixed(1)}°C
+                            {' ('}Δ{(rd.value_mean-cmpRawMap[c.slotId].value_mean).toFixed(1)}°C{')'}
+                          </div>
+                        )}
+                      </div>
+                      {compare&&(
+                        <button onClick={()=>toggleExclude(c.slotId)} title={isEx?'Include in B':'Exclude from B'}
+                          style={{width:20,height:20,borderRadius:4,cursor:'pointer',flexShrink:0,marginTop:1,
+                            border:`1px solid ${isEx?'#f87171':c.color}`,background:isEx?'#f8717122':'transparent',
+                            display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,
+                            color:isEx?'#f87171':c.color}}>
+                          {isEx?'✕':'✓'}
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             )}
           </div>
 
-          {/* Satellite */}
-          <div>
-            <div style={{ fontSize:11, fontWeight:700, color:'var(--text-sec)',
-              textTransform:'uppercase', letterSpacing:'0.08em', marginBottom:8 }}>
-              Select Satellite
-            </div>
-            <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-              {SOURCES.map(src => (
-                <button key={src.id} onClick={() => setSource(src.id)}
-                  style={{
-                    display:'flex', alignItems:'center', gap:8,
-                    padding:'8px 10px', borderRadius:8, cursor:'pointer', textAlign:'left',
-                    border:`1px solid ${source===src.id ? src.color : 'var(--border)'}`,
-                    background:source===src.id ? `${src.color}20` : 'var(--bg-deep)',
-                    transition:'all 0.15s', width:'100%',
-                  }}>
-                  <span style={{ fontSize:14 }}>{src.icon}</span>
+          {/* Data source */}
+          <SidebarSection label="Data Source">
+            <div style={{display:'flex',flexDirection:'column',gap:5}}>
+              {SOURCES.map(s=>(
+                <button key={s.id} onClick={()=>setSource(s.id)}
+                  style={{display:'flex',alignItems:'center',gap:8,padding:'7px 10px',borderRadius:8,
+                    cursor:'pointer',textAlign:'left',width:'100%',
+                    border:`1px solid ${source===s.id?s.color:'var(--border)'}`,
+                    background:source===s.id?`${s.color}18`:'var(--bg-deep)',transition:'all 0.15s'}}>
+                  <span style={{fontSize:13}}>{s.icon}</span>
                   <div>
-                    <div style={{ fontSize:12, fontWeight:600, color:source===src.id?src.color:'var(--text-pri)' }}>{src.label}</div>
-                    <div style={{ fontSize:10, color:'var(--text-sec)' }}>{src.sublabel}</div>
+                    <div style={{fontSize:12,fontWeight:600,color:source===s.id?s.color:'var(--text-pri)'}}>{s.label}</div>
+                    <div style={{fontSize:10,color:'var(--text-sec)'}}>{s.sub}</div>
                   </div>
                 </button>
               ))}
             </div>
-          </div>
+          </SidebarSection>
 
-          {/* Date (single, capped at today-3) */}
-          <div>
-            <div style={{ fontSize:11, fontWeight:700, color:'var(--text-sec)',
-              textTransform:'uppercase', letterSpacing:'0.08em', marginBottom:8 }}>
-              Date
+          {/* Map layer */}
+          <SidebarSection label="Map Layer">
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:5}}>
+              {Object.entries(TILE_LAYERS).map(([key,layer])=>(
+                <button key={key} onClick={()=>setTileMode(key)}
+                  style={{padding:'7px 4px',borderRadius:8,cursor:'pointer',textAlign:'center',
+                    border:`1px solid ${tileMode===key?'#6366f1':'var(--border)'}`,
+                    background:tileMode===key?'#6366f118':'var(--bg-deep)',
+                    color:tileMode===key?'#818cf8':'var(--text-sec)',fontSize:10,fontWeight:600,transition:'all 0.15s'}}>
+                  <div style={{fontSize:15,marginBottom:2}}>{layer.icon}</div>
+                  {layer.label}
+                </button>
+              ))}
             </div>
-            <input type="date" value={date}
-              min={srcObj?.minDate} max={MAX_DATE}
-              onChange={e => setDate(e.target.value)}
-              style={{
-                width:'100%', boxSizing:'border-box', background:'var(--bg-deep)',
-                color:'var(--text-pri)', border:'1px solid var(--border)', borderRadius:8,
-                padding:'6px 10px', fontSize:11, outline:'none', colorScheme:'dark',
-              }} />
-            <div style={{ fontSize:9, color:'var(--text-sec)', marginTop:4 }}>
-              📡 Latest available: {MAX_DATE} (3-day lag)
-            </div>
+            {TILE_LAYERS[tileMode]?.note&&(
+              <div style={{marginTop:6,padding:'5px 8px',borderRadius:6,fontSize:9,
+                background:tileMode==='gibs'?'#6366f115':'#f9731615',
+                border:`1px solid ${tileMode==='gibs'?'#6366f133':'#f9731633'}`,
+                color:tileMode==='gibs'?'#818cf8':'#fb923c'}}>
+                {tileMode==='gibs'?'🛰':'⚠'} {TILE_LAYERS[tileMode].note}
+                {tileMode==='gibs'&&<b style={{display:'block',marginTop:2,color:'var(--text-sec)'}}>Showing: {date}</b>}
+              </div>
+            )}
+          </SidebarSection>
 
-            {/* Quick presets */}
-            <div style={{ display:'flex', flexWrap:'wrap', gap:4, marginTop:8 }}>
-              {[
-                { label:'Yesterday', offset:4 },
-                { label:'-7 days',   offset:10 },
-                { label:'-30 days',  offset:33 },
-                { label:'-1 year',   offset:368 },
-              ].map(p => {
-                const d = new Date(); d.setDate(d.getDate()-p.offset)
-                const val = d.toISOString().split('T')[0]
-                const active = date === val
-                return (
-                  <button key={p.label} onClick={() => setDate(val)}
-                    style={{
-                      fontSize:9, padding:'3px 7px', borderRadius:6, cursor:'pointer',
-                      border:`1px solid ${active?'#6366f1':'var(--border)'}`,
-                      background:active?'#6366f120':'var(--bg-deep)',
-                      color:active?'#6366f1':'var(--text-sec)',
-                    }}>{p.label}</button>
-                )
+          {/* Date */}
+          <SidebarSection label="Date A">
+            <input type="date" value={date} min={srcObj?.min} max={MAX_DATE}
+              onChange={e=>setDate(e.target.value)}
+              style={{width:'100%',boxSizing:'border-box',padding:'6px 10px',fontSize:11,
+                background:'var(--bg-deep)',color:'var(--text-pri)',
+                border:'1px solid var(--border)',borderRadius:8,outline:'none',colorScheme:'dark'}}/>
+            <div style={{fontSize:9,color:'#475569',marginTop:4}}>📡 Latest: {MAX_DATE} (3-day lag)</div>
+            <div style={{display:'flex',flexWrap:'wrap',gap:4,marginTop:6}}>
+              {[{l:'−1d',o:4},{l:'−7d',o:10},{l:'−30d',o:33},{l:'−1yr',o:368}].map(p=>{
+                const d=new Date();d.setDate(d.getDate()-p.o);const val=d.toISOString().split('T')[0];const on=date===val
+                return(<button key={p.l} onClick={()=>setDate(val)}
+                  style={{fontSize:9,padding:'3px 8px',borderRadius:6,cursor:'pointer',
+                    border:`1px solid ${on?'#6366f1':'var(--border)'}`,
+                    background:on?'#6366f118':'var(--bg-deep)',
+                    color:on?'#818cf8':'var(--text-sec)'}}>{p.l}</button>)
               })}
             </div>
-          </div>
+          </SidebarSection>
 
-          {/* Clip boundary */}
-          <div>
-            <label style={{ display:'flex', alignItems:'flex-start', gap:10, cursor:'pointer' }}>
+          {/* Options */}
+          <SidebarSection label="Options">
+            <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer'}}>
               <input type="checkbox" checked={clipBdy} onChange={e=>setClipBdy(e.target.checked)}
-                style={{ marginTop:2, accentColor:'#6366f1', width:14, height:14, cursor:'pointer' }} />
-              <span style={{ fontSize:12, color:'var(--text-sec)', lineHeight:1.4 }}>
-                Clip to boundary
-              </span>
+                style={{accentColor:'#6366f1',width:13,height:13,cursor:'pointer'}}/>
+              <span style={{fontSize:12,color:'var(--text-sec)'}}>Clip to boundary</span>
             </label>
-          </div>
+            <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',marginTop:6}}>
+              <input type="checkbox" checked={showHotspots} onChange={e=>setShowHotspots(e.target.checked)}
+                style={{accentColor:'#f87171',width:13,height:13,cursor:'pointer'}}/>
+              <span style={{fontSize:12,color:'var(--text-sec)'}}>🔥 Show hotspots (90th %ile)</span>
+            </label>
+            <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',marginTop:6}}>
+              <input type="checkbox" checked={showNarrative} onChange={e=>setShowNarrative(e.target.checked)}
+                style={{accentColor:'#22c55e',width:13,height:13,cursor:'pointer'}}/>
+              <span style={{fontSize:12,color:'var(--text-sec)'}}>📝 Auto narrative</span>
+            </label>
+          </SidebarSection>
 
-          {/* Compare toggle */}
+          {/* Compare */}
           <div>
-            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:compare?12:0 }}>
-              <div style={{ fontSize:11, fontWeight:700, color:'var(--text-sec)',
-                textTransform:'uppercase', letterSpacing:'0.08em' }}>
-                Compare Mode
-              </div>
-              {/* Toggle switch */}
-              <div onClick={() => setCompare(c => !c)} style={{ cursor:'pointer' }}>
-                <div style={{
-                  width:36, height:20, borderRadius:10, position:'relative',
-                  background:compare?'#6366f1':'var(--border)', transition:'background 0.2s',
-                }}>
-                  <div style={{
-                    position:'absolute', top:3, left:compare?18:3,
-                    width:14, height:14, borderRadius:'50%', background:'white',
-                    transition:'left 0.2s',
-                  }} />
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:compare?12:0}}>
+              <div style={{fontSize:11,fontWeight:700,color:'var(--text-sec)',textTransform:'uppercase',letterSpacing:'0.08em'}}>Compare</div>
+              <div onClick={()=>setCompare(c=>!c)} style={{cursor:'pointer'}}>
+                <div style={{width:36,height:20,borderRadius:10,position:'relative',background:compare?'#6366f1':'var(--border)',transition:'background 0.2s'}}>
+                  <div style={{position:'absolute',top:3,left:compare?18:3,width:14,height:14,borderRadius:'50%',background:'white',transition:'left 0.2s'}}/>
                 </div>
               </div>
             </div>
-
-            {compare && (
-              <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
-                {/* Compare satellite */}
-                <div style={{ fontSize:10, color:'var(--text-sec)', marginBottom:2 }}>Satellite B</div>
-                <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
-                  {SOURCES.map(s => (
-                    <button key={s.id} onClick={() => setCmpSrc(s.id)}
-                      style={{
-                        display:'flex', alignItems:'center', gap:6,
-                        padding:'6px 8px', borderRadius:8, cursor:'pointer', textAlign:'left',
-                        border:`1px solid ${cmpSrc===s.id ? s.color : 'var(--border)'}`,
-                        background:cmpSrc===s.id?`${s.color}20`:'var(--bg-deep)',
-                        width:'100%',
-                      }}>
-                      <span style={{ fontSize:12 }}>{s.icon}</span>
-                      <div style={{ fontSize:11, fontWeight:600, color:cmpSrc===s.id?s.color:'var(--text-pri)' }}>{s.label}</div>
+            {compare&&(
+              <div style={{display:'flex',flexDirection:'column',gap:10}}>
+                <div style={{fontSize:10,color:'var(--text-sec)'}}>Satellite B</div>
+                <div style={{display:'flex',flexDirection:'column',gap:4}}>
+                  {SOURCES.map(s=>(
+                    <button key={s.id} onClick={()=>setCmpSrc(s.id)}
+                      style={{display:'flex',alignItems:'center',gap:6,padding:'6px 8px',borderRadius:8,cursor:'pointer',textAlign:'left',width:'100%',
+                        border:`1px solid ${cmpSrc===s.id?s.color:'var(--border)'}`,background:cmpSrc===s.id?`${s.color}18`:'var(--bg-deep)'}}>
+                      <span style={{fontSize:12}}>{s.icon}</span>
+                      <div style={{fontSize:11,fontWeight:600,color:cmpSrc===s.id?s.color:'var(--text-pri)'}}>{s.label}</div>
                     </button>
                   ))}
                 </div>
-
-                {/* Compare date */}
-                <div style={{ fontSize:10, color:'var(--text-sec)' }}>Date B</div>
-                <input type="date" value={cmpDate}
-                  min={cmpSrcObj?.minDate} max={MAX_DATE}
-                  onChange={e => setCmpDate(e.target.value)}
-                  style={{
-                    width:'100%', boxSizing:'border-box', background:'var(--bg-deep)',
-                    color:'var(--text-pri)', border:'1px solid #f97316', borderRadius:8,
-                    padding:'6px 10px', fontSize:11, outline:'none', colorScheme:'dark',
-                  }} />
-
-                {/* View mode */}
-                <div style={{ fontSize:10, color:'var(--text-sec)' }}>View mode</div>
-                <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
-                  {[
-                    { id:'sidebyside', label:'Side by side', icon:'⬛⬜' },
-                    { id:'fade',       label:'Fade / Opacity', icon:'◑' },
-                    { id:'swipe',      label:'Swipe compare', icon:'↔' },
-                  ].map(m => (
-                    <button key={m.id} onClick={() => setCmpMode(m.id)}
-                      style={{
-                        padding:'6px 10px', borderRadius:8, cursor:'pointer', textAlign:'left',
+                <div style={{fontSize:10,color:'var(--text-sec)'}}>Date B</div>
+                <input type="date" value={cmpDate} min={cmpSrcObj?.min} max={MAX_DATE}
+                  onChange={e=>setCmpDate(e.target.value)}
+                  style={{width:'100%',boxSizing:'border-box',padding:'6px 10px',fontSize:11,
+                    background:'var(--bg-deep)',color:'var(--text-pri)',
+                    border:'1px solid #f97316',borderRadius:8,outline:'none',colorScheme:'dark'}}/>
+                <div style={{display:'flex',flexDirection:'column',gap:4}}>
+                  {[{id:'sidebyside',label:'Side by side',icon:'⬛⬜'},
+                    {id:'fade',label:'Fade / Opacity',icon:'◑'},
+                    {id:'swipe',label:'Swipe compare',icon:'↔'}].map(m=>(
+                    <button key={m.id} onClick={()=>setCmpMode(m.id)}
+                      style={{padding:'6px 10px',borderRadius:8,cursor:'pointer',textAlign:'left',
                         border:`1px solid ${cmpMode===m.id?'#f97316':'var(--border)'}`,
-                        background:cmpMode===m.id?'#f9731620':'var(--bg-deep)',
+                        background:cmpMode===m.id?'#f9731618':'var(--bg-deep)',
                         color:cmpMode===m.id?'#f97316':'var(--text-sec)',
-                        fontSize:11, fontWeight:cmpMode===m.id?700:400,
-                        display:'flex', alignItems:'center', gap:8,
-                      }}>
-                      <span>{m.icon}</span> {m.label}
+                        fontSize:11,fontWeight:cmpMode===m.id?700:400,
+                        display:'flex',alignItems:'center',gap:8}}>
+                      <span>{m.icon}</span>{m.label}
                     </button>
                   ))}
                 </div>
-
-                {/* Fade slider */}
-                {cmpMode==='fade' && (
+                {cmpMode==='fade'&&(
                   <div>
-                    <div style={{ display:'flex', justifyContent:'space-between', fontSize:9, color:'var(--text-sec)', marginBottom:4 }}>
-                      <span>A ({date})</span><span>B ({cmpDate})</span>
+                    <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:'var(--text-sec)',marginBottom:4}}>
+                      <span>A: {100-fadeOp}%</span><span>B: {fadeOp}%</span>
                     </div>
-                    <input type="range" min={0} max={100} value={fadeOpacity}
-                      onChange={e => setFadeOp(+e.target.value)}
-                      style={{ width:'100%', accentColor:'#f97316' }} />
-                    <div style={{ fontSize:9, color:'var(--text-sec)', textAlign:'center', marginTop:2 }}>
-                      A: {100-fadeOpacity}% · B: {fadeOpacity}%
-                    </div>
+                    <input type="range" min={0} max={100} value={fadeOp} onChange={e=>setFadeOp(+e.target.value)}
+                      style={{width:'100%',accentColor:'#f97316'}}/>
                   </div>
                 )}
+                {anyLoadingB&&<div style={{fontSize:10,color:'#f97316'}}>⏳ Fetching B…</div>}
 
-                {cmpError && <div style={{ fontSize:10, color:'#f87171' }}>{cmpError}</div>}
-                {cmpLoading && <div style={{ fontSize:10, color:'#f97316' }}>⏳ Fetching B…</div>}
-
-                {/* Compare stats */}
-                {cmpRaw && !cmpLoading && (
-                  <div style={{ background:'var(--bg-deep)', borderRadius:8, padding:10 }}>
-                    <div style={{ fontSize:10, color:'#f97316', fontWeight:700, marginBottom:6 }}>B: {cmpDate}</div>
-                    {[['Min', cmpRaw.value_min.toFixed(1)+'°C','#38bdf8'],
-                      ['Mean',cmpRaw.value_mean.toFixed(1)+'°C','#fb923c'],
-                      ['Max', cmpRaw.value_max.toFixed(1)+'°C','#f87171'],
-                    ].map(([l,v,c])=>(
-                      <div key={l} style={{ display:'flex', justifyContent:'space-between', fontSize:11, marginBottom:3 }}>
-                        <span style={{ color:'var(--text-sec)' }}>{l}</span>
-                        <span style={{ color:c, fontFamily:'var(--font-mono)', fontWeight:700 }}>{v}</span>
-                      </div>
-                    ))}
-                    {rawData && (
-                      <div style={{ display:'flex', justifyContent:'space-between', fontSize:11, marginTop:6,
-                        paddingTop:6, borderTop:'1px solid var(--border)' }}>
-                        <span style={{ color:'var(--text-sec)' }}>Δ Mean</span>
-                        <span style={{
-                          color: rawData.value_mean > cmpRaw.value_mean ? '#f87171' : '#4ade80',
-                          fontFamily:'var(--font-mono)', fontWeight:700,
-                        }}>
-                          {rawData.value_mean > cmpRaw.value_mean ? '+' : ''}{(rawData.value_mean - cmpRaw.value_mean).toFixed(1)}°C
-                        </span>
-                      </div>
-                    )}
+                {/* Per-city B stats */}
+                {activeCmpCities.some(c=>cmpRawMap[c.slotId])&&(
+                  <div style={{background:'var(--bg-deep)',borderRadius:8,padding:10,border:'1px solid var(--border)'}}>
+                    <div style={{fontSize:10,fontWeight:700,color:'#f97316',marginBottom:8}}>B: {cmpDate}</div>
+                    {activeCmpCities.map(c=>{
+                      const rdB=cmpRawMap[c.slotId];const rdA=cityRaw[c.slotId];if(!rdB)return null
+                      const delta=rdA?rdA.value_mean-rdB.value_mean:null
+                      return(
+                        <div key={c.slotId} style={{marginBottom:10,paddingBottom:10,borderBottom:'1px solid var(--border)'}}>
+                          <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:6}}>
+                            <div style={{width:6,height:6,borderRadius:'50%',background:c.color}}/>
+                            <span style={{fontSize:11,fontWeight:700,color:c.color}}>{c.name}</span>
+                          </div>
+                          <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:4}}>
+                            {[['Min',rdB.value_min.toFixed(1)+'°C','#38bdf8'],
+                              ['Mean',rdB.value_mean.toFixed(1)+'°C','#fb923c'],
+                              ['Max',rdB.value_max.toFixed(1)+'°C','#f87171'],
+                              delta!==null?['Δ',(delta>0?'+':'')+delta.toFixed(1)+'°C',delta>0?'#f87171':'#4ade80']:null
+                            ].filter(Boolean).map(([l,v,col])=>(
+                              <div key={l} style={{textAlign:'center',background:'var(--bg-card)',borderRadius:6,padding:'4px 2px'}}>
+                                <div style={{fontSize:8,color:'var(--text-sec)',marginBottom:2}}>{l}</div>
+                                <div style={{fontSize:11,fontWeight:700,color:col,fontFamily:'var(--font-mono)'}}>{v}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )
+                    })}
                   </div>
                 )}
               </div>
             )}
           </div>
-
-          {/* Loading indicator */}
-          {anyLoading && (
-            <div style={{ fontSize:11, color:'#6366f1', fontFamily:'var(--font-mono)' }}>
-              ⏳ Fetching {srcObj?.label}…
-            </div>
-          )}
+          {anyLoadingA&&<div style={{fontSize:11,color:'#6366f1',fontFamily:'var(--font-mono)'}}>⏳ {srcObj?.label}…</div>}
         </div>
 
-        {/* ── MAP AREA ──────────────────────────────────────────────────────── */}
-        <div style={{ flex:1, display:'flex', flexDirection:'column', gap:12, minWidth:0 }}>
+        {/* ── MAP + STATS ──────────────────────────────────────────────────── */}
+        <div style={{flex:1,display:'flex',flexDirection:'column',gap:10,minWidth:0}}>
 
-          {/* Map container */}
-          <div style={{ flex:1, borderRadius:12, overflow:'hidden',
-            border:'1px solid var(--border)', minHeight:400, position:'relative' }}>
+          {/* Map */}
+          <div id="ts-map-area" style={{flex:1,borderRadius:12,overflow:'hidden',border:'1px solid var(--border)',minHeight:400,position:'relative'}}>
+            {anyLoadingA&&cityList.length>0&&<MapSkeleton/>}
 
-            {/* SWIPE mode */}
-            {compare && cmpMode==='swipe' ? (
-              <SwipeMap
-                cityA={city} pixelsA={pixels}   colorA={srcObj?.color||'#6366f1'}
-                cityB={city} pixelsB={cmpPixels} colorB={cmpSrcObj?.color||'#f97316'}
-                vmin={vmin} vmax={vmax} flyTarget={flyTarget}
-              />
-            ) : compare && cmpMode==='sidebyside' ? (
-              /* SIDE BY SIDE mode */
-              <div style={{ display:'flex', height:'100%' }}>
-                <div style={{ flex:1, position:'relative', borderRight:'2px solid var(--border)' }}>
-                  <div style={{ position:'absolute',top:8,left:8,zIndex:1000,
-                    background:'rgba(10,14,26,0.85)',border:`1px solid ${srcObj?.color}`,
-                    borderRadius:8,padding:'4px 10px',fontSize:10,fontWeight:700,color:srcObj?.color }}>
+            {compare&&cmpMode==='swipe'?(
+              <SwipeMap cityList={cityList} cityPixelsA={cityPixels} cityPixelsB={cmpPxMap}
+                cmpExcluded={cmpExcluded} vmin={vmin} vmax={vmax} flyTarget={flyTarget}
+                srcColor={srcObj?.color||'#6366f1'} cmpColor={cmpSrcObj?.color||'#f97316'}
+                tileMode={tileMode} date={date} cmpDate={cmpDate}
+                showHotspots={showHotspots} threshMap={threshMap} onPixelClick={p=>setSelectedPixel(p)}/>
+
+            ):compare&&cmpMode==='sidebyside'?(
+              <div style={{display:'flex',height:'100%'}}>
+                <div style={{flex:1,position:'relative',borderRight:'2px solid var(--border)'}}>
+                  <div style={{position:'absolute',top:8,left:8,zIndex:1000,background:'rgba(10,14,26,0.88)',
+                    border:`1px solid ${srcObj?.color}`,borderRadius:8,padding:'4px 10px',fontSize:10,fontWeight:700,color:srcObj?.color}}>
                     A · {date} · {srcObj?.label}
                   </div>
-                  <MapContainer center={city?.center||[22.55,88.37]} zoom={city?.zoom||5}
-                    style={{ height:'100%', width:'100%', background:'#0a0e1a' }}>
-                    <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" attribution='&copy; CARTO' />
-                    {flyTarget && <MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom} />}
-                    {city?.boundary && <GeoJSON data={city.boundary} style={{ color:srcObj?.color, weight:2, fillOpacity:0 }} />}
-                    {pixels.map((p,i) => (
-                      <CircleMarker key={i} center={[p.lat,p.lon]} radius={6}
-                        pathOptions={{ fillColor:lstToColor(p.value,vmin,vmax), fillOpacity:0.88, color:'transparent', weight:0 }} />
-                    ))}
+                  <MapContainer center={mapCenter} zoom={mapZoom} style={{height:'100%',width:'100%',background:'#0a0e1a'}}>
+                    <BaseTileLayer tileMode={tileMode} date={date}/>
+                    {flyTarget&&<MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom}/>}
+                    <MapSync sourceRef={mapARef} targetRef={mapBRef}/>
+                    <MapHoverEmitter onHover={(la,lo)=>setHoverLL([la,lo])}/>
+                    {cityList.map(c=>c.boundary&&<GeoJSON key={c.slotId} data={c.boundary} style={{color:c.color,weight:2,fillOpacity:0}}/>)}
+                    {cityList.map(c=><PixelLayer key={c.slotId} pixels={cityPixels[c.slotId]||[]} vmin={vmin} vmax={vmax} thresh={threshMap[c.slotId]} showHotspots={showHotspots} onPixelClick={p=>setSelectedPixel(p)}/>)}
+                    <SyncedHoverLayer hoverLatLon={hoverLL} pixels={cityPixels} cityList={cityList} label="A" color={srcObj?.color||'#6366f1'}/>
+                    <TileToggleButton tileMode={tileMode} setTileMode={setTileMode}/>
                   </MapContainer>
                 </div>
-                <div style={{ flex:1, position:'relative' }}>
-                  <div style={{ position:'absolute',top:8,left:8,zIndex:1000,
-                    background:'rgba(10,14,26,0.85)',border:`1px solid ${cmpSrcObj?.color}`,
-                    borderRadius:8,padding:'4px 10px',fontSize:10,fontWeight:700,color:cmpSrcObj?.color }}>
+                <div style={{flex:1,position:'relative'}}>
+                  <div style={{position:'absolute',top:8,left:8,zIndex:1000,background:'rgba(10,14,26,0.88)',
+                    border:`1px solid ${cmpSrcObj?.color}`,borderRadius:8,padding:'4px 10px',fontSize:10,fontWeight:700,color:cmpSrcObj?.color}}>
                     B · {cmpDate||'—'} · {cmpSrcObj?.label}
                   </div>
-                  <MapContainer center={city?.center||[22.55,88.37]} zoom={city?.zoom||5}
-                    style={{ height:'100%', width:'100%', background:'#0a0e1a' }}>
-                    <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" attribution='&copy; CARTO' />
-                    {flyTarget && <MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom} />}
-                    {city?.boundary && <GeoJSON data={city.boundary} style={{ color:cmpSrcObj?.color, weight:2, fillOpacity:0 }} />}
-                    {cmpPixels.map((p,i) => (
-                      <CircleMarker key={i} center={[p.lat,p.lon]} radius={6}
-                        pathOptions={{ fillColor:lstToColor(p.value,vmin,vmax), fillOpacity:0.88, color:'transparent', weight:0 }} />
-                    ))}
+                  <MapContainer center={mapCenter} zoom={mapZoom} style={{height:'100%',width:'100%',background:'#0a0e1a'}}>
+                    <BaseTileLayer tileMode={tileMode} date={cmpDate||date}/>
+                    {flyTarget&&<MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom}/>}
+                    <MapSync sourceRef={mapBRef} targetRef={mapARef}/>
+                    <MapHoverEmitter onHover={(la,lo)=>setHoverLL([la,lo])}/>
+                    {activeCmpCities.map(c=>c.boundary&&<GeoJSON key={c.slotId} data={c.boundary} style={{color:c.color,weight:2,fillOpacity:0}}/>)}
+                    {activeCmpCities.map(c=><PixelLayer key={c.slotId} pixels={cmpPxMap[c.slotId]||[]} vmin={vmin} vmax={vmax} thresh={threshMap[c.slotId]} showHotspots={showHotspots}/>)}
+                    <SyncedHoverLayer hoverLatLon={hoverLL} pixels={cmpPxMap} cityList={activeCmpCities} label="B" color={cmpSrcObj?.color||'#f97316'}/>
+                    <TileToggleButton tileMode={tileMode} setTileMode={setTileMode}/>
                   </MapContainer>
                 </div>
               </div>
-            ) : (
-              /* SINGLE MAP (with optional fade overlay) */
-              <MapContainer center={city?.center||[22.55,88.37]} zoom={city?.zoom||5}
-                style={{ height:'100%', width:'100%', background:'#0a0e1a' }}>
-                <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" attribution='&copy; CARTO' />
-                {flyTarget && <MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom} />}
 
-                {/* Primary boundary + pixels */}
-                {city?.boundary && <GeoJSON data={city.boundary} style={{ color:srcObj?.color, weight:2, fillOpacity:0 }} />}
-                {pixels.map((p,i) => (
-                  <CircleMarker key={`a${i}`} center={[p.lat,p.lon]} radius={6}
-                    pathOptions={{ fillColor:lstToColor(p.value,vmin,vmax),
-                      fillOpacity: compare && cmpMode==='fade' ? (100-fadeOpacity)/100*0.88 : 0.88,
-                      color:'transparent', weight:0 }}>
-                    <Tooltip><div style={{ fontFamily:'monospace',fontSize:11 }}>
-                      <div style={{ fontWeight:600, color:srcObj?.color }}>{city?.name} (A)</div>
-                      <div>{p.lat.toFixed(4)}°N, {p.lon.toFixed(4)}°E</div>
-                      <div><b>LST:</b> {p.value.toFixed(1)}°C</div>
-                    </div></Tooltip>
-                  </CircleMarker>
-                ))}
-
-                {/* Fade compare overlay */}
-                {compare && cmpMode==='fade' && cmpPixels.map((p,i) => (
-                  <CircleMarker key={`b${i}`} center={[p.lat,p.lon]} radius={6}
-                    pathOptions={{ fillColor:lstToColor(p.value,vmin,vmax),
-                      fillOpacity:fadeOpacity/100*0.88, color:'transparent', weight:0 }}>
-                    <Tooltip><div style={{ fontFamily:'monospace',fontSize:11 }}>
-                      <div style={{ fontWeight:600, color:cmpSrcObj?.color }}>{city?.name} (B)</div>
-                      <div>{p.lat.toFixed(4)}°N, {p.lon.toFixed(4)}°E</div>
-                      <div><b>LST:</b> {p.value.toFixed(1)}°C</div>
-                    </div></Tooltip>
-                  </CircleMarker>
-                ))}
-
-                {/* Empty state */}
-                {!city && (
-                  <div style={{
-                    position:'absolute',top:'50%',left:'50%',transform:'translate(-50%,-50%)',
-                    background:'rgba(10,14,26,0.85)',padding:'24px 40px',borderRadius:12,
-                    zIndex:1000,textAlign:'center',border:'1px solid var(--border)',
-                  }}>
-                    <div style={{ fontSize:36, marginBottom:8 }}>🌍</div>
-                    <div style={{ color:'var(--text-pri)',fontSize:15,fontWeight:600 }}>Search any city</div>
-                    <div style={{ color:'var(--text-sec)',fontSize:12,marginTop:6 }}>
-                      MODIS · Landsat 8 · Sentinel-2 real satellite data
-                    </div>
+            ):(
+              <MapContainer center={mapCenter} zoom={mapZoom} style={{height:'100%',width:'100%',background:'#0a0e1a'}}>
+                <BaseTileLayer tileMode={tileMode} date={date}/>
+                {flyTarget&&<MapFlyTo center={flyTarget.center} zoom={flyTarget.zoom}/>}
+                {cityList.map(c=>c.boundary&&<GeoJSON key={c.slotId} data={c.boundary} style={{color:c.color,weight:2,fillOpacity:0}}/>)}
+                {cityList.map(c=><PixelLayer key={c.slotId} pixels={cityPixels[c.slotId]||[]} vmin={vmin} vmax={vmax} thresh={threshMap[c.slotId]} showHotspots={showHotspots} opacity={compare&&cmpMode==='fade'?(100-fadeOp)/100*0.88:0.88} onPixelClick={p=>setSelectedPixel(p)}/>)}
+                {compare&&cmpMode==='fade'&&activeCmpCities.map(c=><PixelLayer key={`b${c.slotId}`} pixels={cmpPxMap[c.slotId]||[]} vmin={vmin} vmax={vmax} thresh={threshMap[c.slotId]} showHotspots={showHotspots} opacity={fadeOp/100*0.88}/>)}
+                {cityList.length===0&&(
+                  <div style={{position:'absolute',top:'50%',left:'50%',transform:'translate(-50%,-50%)',
+                    background:'rgba(10,14,26,0.88)',padding:'28px 44px',borderRadius:14,
+                    zIndex:1000,textAlign:'center',border:'1px solid var(--border)'}}>
+                    <div style={{fontSize:40,marginBottom:10}}>🌍</div>
+                    <div style={{color:'var(--text-pri)',fontSize:15,fontWeight:600,marginBottom:6}}>Search any city above</div>
+                    <div style={{color:'#475569',fontSize:12}}>Up to 6 cities · Real NASA satellite LST data</div>
                   </div>
                 )}
+                <TileToggleButton tileMode={tileMode} setTileMode={setTileMode}/>
               </MapContainer>
             )}
           </div>
 
-          {/* Color scale footer */}
-          {rawData && (
-            <div style={{ display:'flex', alignItems:'center', gap:10,
-              background:'var(--bg-card)', border:'1px solid var(--border)',
-              borderRadius:8, padding:'8px 14px' }}>
-              <span style={{ fontSize:11,color:'var(--text-sec)',fontFamily:'var(--font-mono)',whiteSpace:'nowrap' }}>
-                {vmin.toFixed(1)}°C
-              </span>
-              <div style={{ flex:1, height:10, borderRadius:5,
-                background:'linear-gradient(to right,#3b82f6,#06b6d4,#eab308,#f97316,#ef4444)' }} />
-              <span style={{ fontSize:11,color:'var(--text-sec)',fontFamily:'var(--font-mono)',whiteSpace:'nowrap' }}>
-                {vmax.toFixed(1)}°C
-              </span>
-              <span style={{ fontSize:10,color:'var(--text-sec)',marginLeft:8,whiteSpace:'nowrap' }}>
-                {srcObj?.label} · {date}
-                {compare && cmpRaw && ` vs ${cmpDate}`}
-              </span>
-            </div>
-          )}
-
-          {/* Stats cards */}
-          {rawData && (
-            <div style={{ display:'flex', gap:10 }}>
-              {[
-                { label:'City',   value:rawData.city,                     style:{ color:'#6366f1',fontSize:13 } },
-                { label:'Source', value:rawData.source,                   style:{ fontSize:10,color:'var(--text-sec)' } },
-                { label:'Date',   value:date,                             style:{ fontSize:11,color:'var(--text-sec)' } },
-                { label:'Min',    value:`${rawData.value_min.toFixed(1)}°C`, style:{ color:'#38bdf8',fontSize:16 } },
-                { label:'Mean',   value:`${rawData.value_mean.toFixed(1)}°C`,style:{ color:'#fb923c',fontSize:16 } },
-                { label:'Max',    value:`${rawData.value_max.toFixed(1)}°C`, style:{ color:'#f87171',fontSize:16 } },
-                { label:'Pixels', value:pixels.length.toLocaleString(),   style:{ fontSize:16 } },
-              ].map((c,i) => (
-                <div key={i} className="card" style={{ flex:1 }}>
-                  <div className="card-label">{c.label}</div>
-                  <div className="card-value" style={c.style}>{c.value}</div>
+          {/* Color scale with ticks */}
+          {hasData&&(
+            <div style={{background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:10,padding:'10px 16px'}}>
+              <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:6}}>
+                <span style={{fontSize:11,color:'var(--text-sec)',fontFamily:'var(--font-mono)',whiteSpace:'nowrap'}}>{vmin.toFixed(1)}°C</span>
+                <div style={{flex:1,position:'relative',height:12,borderRadius:6,
+                  background:'linear-gradient(to right,#3b82f6,#06b6d4,#eab308,#f97316,#ef4444)'}}>
+                  {/* tick marks */}
+                  {tickVals.map((v,i)=>(
+                    <div key={i} style={{position:'absolute',left:`${(i/ticks)*100}%`,top:-4,bottom:-4,
+                      width:1,background:'rgba(255,255,255,0.3)',transform:'translateX(-50%)'}}/>
+                  ))}
                 </div>
-              ))}
+                <span style={{fontSize:11,color:'var(--text-sec)',fontFamily:'var(--font-mono)',whiteSpace:'nowrap'}}>{vmax.toFixed(1)}°C</span>
+              </div>
+              {/* tick labels */}
+              <div style={{display:'flex',justifyContent:'space-between',paddingLeft:42,paddingRight:52}}>
+                {tickVals.map((v,i)=>(
+                  <div key={i} style={{textAlign:'center'}}>
+                    <div style={{fontSize:9,color:'#475569'}}>{tickLabels[i]}</div>
+                    <div style={{fontSize:8,color:'#334155',fontFamily:'monospace'}}>{v.toFixed(0)}°C</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{marginTop:4,fontSize:9,color:'#334155',textAlign:'right'}}>
+                {srcObj?.label} · {date}{compare&&Object.keys(cmpRawMap).length>0?` vs ${cmpDate} (${cmpSrcObj?.label})`:''}
+                {showHotspots&&' · 🔥 hotspots = 90th percentile'}
+              </div>
             </div>
           )}
 
+          {/* Stats — A and B side by side per city */}
+          {cityList.map(c=>{
+            const rdA=cityRaw[c.slotId];const px=cityPixels[c.slotId]||[]
+            if(!rdA)return null
+            const rdB=compare&&!cmpExcluded.has(c.slotId)?cmpRawMap[c.slotId]:null
+            const uhi=computeUHI(px)
+            const hotN=px.filter(p=>p.value>=(threshMap[c.slotId]||Infinity)).length
+            return(
+              <div key={c.slotId} style={{borderRadius:10,border:`1px solid ${c.color}33`,overflow:'hidden'}}>
+                {/* City header */}
+                <div style={{display:'flex',alignItems:'center',gap:10,padding:'8px 14px',background:`${c.color}0d`,borderBottom:`1px solid ${c.color}22`}}>
+                  <div style={{width:8,height:8,borderRadius:'50%',background:c.color}}/>
+                  <span style={{fontSize:13,fontWeight:700,color:c.color}}>{c.name}</span>
+                  <span style={{fontSize:10,color:'var(--text-sec)',marginLeft:'auto'}}>{rdA.source} · {date}</span>
+                </div>
+                {/* Stats grid */}
+                <div style={{display:'grid',gridTemplateColumns:rdB?'1fr 1fr':'1fr',gap:0}}>
+                  {/* A column */}
+                  <div style={{padding:'10px 14px',background:'var(--bg-card)'}}>
+                    {rdB&&<div style={{fontSize:9,color:'var(--text-sec)',fontWeight:700,textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6}}>A · {date}</div>}
+                    <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                      {[['Min',rdA.value_min.toFixed(1)+'°C','#38bdf8'],
+                        ['Mean',rdA.value_mean.toFixed(1)+'°C','#fb923c'],
+                        ['Max',rdA.value_max.toFixed(1)+'°C','#f87171'],
+                        ['Pixels',px.length.toLocaleString(),'var(--text-sec)'],
+                        uhi?['UHI',uhi+'°C','#a78bfa']:null,
+                        hotN>0?['Hotspots',hotN,'#fbbf24']:null,
+                      ].filter(Boolean).map(([l,v,col])=>(
+                        <div key={l} style={{textAlign:'center',minWidth:48}}>
+                          <div style={{fontSize:9,color:'var(--text-sec)',marginBottom:2}}>{l}</div>
+                          <div style={{fontSize:14,fontWeight:700,color:col,fontFamily:'var(--font-mono)'}}>{v}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  {/* B column */}
+                  {rdB&&(
+                    <div style={{padding:'10px 14px',background:'#f9731608',borderLeft:'1px solid var(--border)'}}>
+                      <div style={{fontSize:9,color:'#f97316',fontWeight:700,textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6}}>B · {cmpDate}</div>
+                      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                        {[['Min',rdB.value_min.toFixed(1)+'°C','#38bdf8'],
+                          ['Mean',rdB.value_mean.toFixed(1)+'°C','#fb923c'],
+                          ['Max',rdB.value_max.toFixed(1)+'°C','#f87171'],
+                          ['Δ Mean',(rdA.value_mean>rdB.value_mean?'+':'')+(rdA.value_mean-rdB.value_mean).toFixed(1)+'°C',
+                            rdA.value_mean>rdB.value_mean?'#f87171':'#4ade80'],
+                        ].map(([l,v,col])=>(
+                          <div key={l} style={{textAlign:'center',minWidth:48}}>
+                            <div style={{fontSize:9,color:'var(--text-sec)',marginBottom:2}}>{l}</div>
+                            <div style={{fontSize:14,fontWeight:700,color:col,fontFamily:'var(--font-mono)'}}>{v}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+
+          {/* Narrative */}
+          {showNarrative&&narrative&&(
+            <div style={{borderRadius:10,border:'1px solid #22c55e33',background:'#22c55e08',padding:'12px 16px'}}>
+              <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+                <span style={{fontSize:14}}>📝</span>
+                <span style={{fontSize:11,fontWeight:700,color:'#4ade80',textTransform:'uppercase',letterSpacing:'0.08em'}}>
+                  AI Analysis
+                </span>
+                <span style={{fontSize:9,color:'#475569',marginLeft:'auto'}}>Auto-generated · {new Date().toLocaleDateString()}</span>
+              </div>
+              <p style={{fontSize:12,color:'#94a3b8',lineHeight:1.7,margin:0}}>{narrative}</p>
+            </div>
+          )}
         </div>
       </div>
+    {/* Time series modal */}
+    {selectedPixel&&(
+      <TimeSeriesModal pixel={selectedPixel} source={source} onClose={()=>setSelectedPixel(null)}/>
+    )}
+    </div>
+  )
+}
+
+// ── SidebarSection helper ─────────────────────────────────────────────────────
+function SidebarSection({label,children}){
+  return(
+    <div>
+      <div style={{fontSize:11,fontWeight:700,color:'var(--text-sec)',textTransform:'uppercase',
+        letterSpacing:'0.08em',marginBottom:8}}>{label}</div>
+      {children}
     </div>
   )
 }
